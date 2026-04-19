@@ -338,6 +338,10 @@ int ovs_of_connect(const char *bridge)
     snprintf(path, sizeof(path),
              "/var/run/openvswitch/%s.mgmt", bridge);
 
+    char path2[256];
+    snprintf(path2, sizeof(path2),
+             "/var/run/openvswitch/%s.snoop", bridge);
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         LOG_E("OF", "socket() failed errno=%d", errno);
@@ -352,7 +356,13 @@ int ovs_of_connect(const char *bridge)
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_E("OF", "connect %s failed errno=%d", path, errno);
+        LOG_W("OF", "connect %s failed errno=%d — checking if vswitchd is running",
+              path, errno);
+        /* Check if the socket file exists at all */
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            LOG_E("OF", "Socket %s does not exist — is ovs-vswitchd running?", path);
+        }
         close(fd);
         return -1;
     }

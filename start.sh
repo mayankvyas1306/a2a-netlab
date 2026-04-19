@@ -11,6 +11,10 @@ docker ps -a --format '{{.Names}}' | grep -E '^sw[0-9]+$'    | xargs -r docker r
 docker ps -a --format '{{.Names}}' | grep -E '^core[0-9]+$'  | xargs -r docker rm -f
 docker ps -a --format '{{.Names}}' | grep -E '^r[0-9]+$'     | xargs -r docker rm -f
 
+# Ensure a2a-mgmt network exists
+docker network inspect a2a-mgmt >/dev/null 2>&1 || \
+    docker network create --driver bridge --subnet 172.28.0.0/16 a2a-mgmt
+
 echo "Creating 16 host containers..."
 for i in {1..16}; do
     docker run -dit --name host$i --network a2a-mgmt --privileged hpe-netlab

@@ -109,6 +109,38 @@ start_agent() {
     echo "[DEPLOY] Started agent in $CONTAINER → logs: $LOGFILE"
 }
 
+log "Verifying OVS is running on all containers..."
+OVS_OK=1
+for c in core1 core2 core3 core4 sw1 sw2 sw3 sw4 sw5 sw6 sw7 sw8; do
+    if ! docker exec $c test -f /var/run/openvswitch/ovs-vswitchd.pid 2>/dev/null; then
+        echo "[ERROR] vswitchd not running in $c — attempting restart..."
+        docker exec $c bash -c "
+            ovs-vswitchd \
+                --pidfile=/var/run/openvswitch/ovs-vswitchd.pid \
+                --log-file=/var/log/openvswitch/ovs-vswitchd.log \
+                --detach --no-chdir \
+                unix:/var/run/openvswitch/db.sock
+            sleep 2
+        " || true
+        if ! docker exec $c test -f /var/run/openvswitch/ovs-vswitchd.pid 2>/dev/null; then
+            echo "[FATAL] Cannot restart vswitchd in $c. Run start.sh again."
+            OVS_OK=0
+        fi
+    else
+        echo "  $c: vswitchd OK"
+    fi
+done
+[ "$OVS_OK" -eq 0 ] && echo "[ABORT] Fix OVS before deploying agents." && exit 1
+
+log "Configuring OVS controller listeners..."
+for c in core1 core2 core3 core4 sw1 sw2 sw3 sw4 sw5 sw6 sw7 sw8; do
+    docker exec $c ovs-vsctl set-controller br0 \
+        "punix:/var/run/openvswitch/br0.mgmt" 2>/dev/null || true
+    docker exec $c ovs-vsctl set bridge br0 \
+        protocols=OpenFlow13 2>/dev/null || true
+done
+log "OVS controllers configured"
+
 # ─────────────────────────────────────────────────────────────
 # Start L3 agents (USING MGMT IP)
 # ─────────────────────────────────────────────────────────────
