@@ -59,26 +59,64 @@ configure_ovs_switch() {
     log "Configuring OVS on $SW"
     docker exec $SW bash -c "
         mkdir -p /var/run/openvswitch /etc/openvswitch /var/log/openvswitch
-        if [ ! -f /etc/openvswitch/conf.db ]; then
-            ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
-        fi
-        ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
+
+        # Stop any existing instances cleanly
+        ovs-appctl exit 2>/dev/null || true
+        pkill ovsdb-server 2>/dev/null || true
+        pkill ovs-vswitchd 2>/dev/null || true
+        sleep 1
+        rm -f /var/run/openvswitch/*.pid /var/run/openvswitch/*.ctl
+        rm -f /var/run/openvswitch/db.sock
+
+        # Create fresh DB
+        ovsdb-tool create /etc/openvswitch/conf.db \
+            /usr/share/openvswitch/vswitch.ovsschema
+
+        # Start OVSDB server
+        ovsdb-server \
+            /etc/openvswitch/conf.db \
+            --remote=punix:/var/run/openvswitch/db.sock \
             --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
-            --pidfile=/var/run/openvswitch/ovsdb-server.pid --detach
+            --pidfile=/var/run/openvswitch/ovsdb-server.pid \
+            --log-file=/var/log/openvswitch/ovsdb-server.log \
+            --detach --no-chdir
         sleep 1
+
         ovs-vsctl --no-wait init
-        ovs-vswitchd --pidfile=/var/run/openvswitch/ovs-vswitchd.pid --detach
-        sleep 1
+
+        # Start vswitchd — force userspace datapath to avoid
+        # conflict with host kernel OVS module
+        ovs-vswitchd \
+            --pidfile=/var/run/openvswitch/ovs-vswitchd.pid \
+            --log-file=/var/log/openvswitch/ovs-vswitchd.log \
+            --detach --no-chdir \
+            unix:/var/run/openvswitch/db.sock
+
+        # Wait until vswitchd is ready (up to 10s)
+        for i in \$(seq 1 10); do
+            ovs-vsctl show >/dev/null 2>&1 && break
+            sleep 1
+        done
+
         ovs-vsctl add-br br0
         ovs-vsctl set bridge br0 fail-mode=standalone
+        ovs-vsctl set bridge br0 datapath_type=netdev
     "
-    # FIX: use fail-mode=standalone so basic L2 forwarding works even before
+    #  use fail-mode=standalone so basic L2 forwarding works even before
     # the A2A agent connects. The agent installs higher-priority flows on top.
     for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0)$'); do
         docker exec $SW bash -c "ip link set $iface up; ovs-vsctl --if-exists del-port br0 $iface; ovs-vsctl add-port br0 $iface"
         log "$SW: added port $iface"
     done
     docker exec $SW ip link set br0 up
+      # Verify vswitchd is still alive after all port additions
+    if ! docker exec $SW test -f /var/run/openvswitch/ovs-vswitchd.pid; then
+        log "WARNING: vswitchd died in $SW during port setup — check /var/log/openvswitch/ovs-vswitchd.log"
+    else
+        local FLOW_COUNT
+        FLOW_COUNT=$(docker exec $SW ovs-ofctl -O OpenFlow13 dump-flows br0 2>/dev/null | grep -c "actions" || echo 0)
+        log "$SW: br0 UP, vswitchd alive, $FLOW_COUNT flows"
+    fi
 }
 for i in {1..8}; do configure_ovs_switch sw$i; done
 
@@ -87,23 +125,47 @@ for i in {1..8}; do configure_ovs_switch sw$i; done
 # so OSPF hello packets are processed by the kernel IP stack.
 configure_ovs_core() {
     CORE=$1
-    ACCESS_IF=$2   # Only this interface goes into br0 (faces the L2 access domain)
+    ACCESS_IF=$2
     GW_IP=$3
     log "Configuring OVS on $CORE (access-only: $ACCESS_IF)"
     docker exec $CORE bash -c "
         mkdir -p /var/run/openvswitch /etc/openvswitch /var/log/openvswitch
-        if [ ! -f /etc/openvswitch/conf.db ]; then
-            ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
-        fi
-        ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
+
+        ovs-appctl exit 2>/dev/null || true
+        pkill ovsdb-server 2>/dev/null || true
+        pkill ovs-vswitchd 2>/dev/null || true
+        sleep 1
+        rm -f /var/run/openvswitch/*.pid /var/run/openvswitch/*.ctl
+        rm -f /var/run/openvswitch/db.sock
+
+        ovsdb-tool create /etc/openvswitch/conf.db \
+            /usr/share/openvswitch/vswitch.ovsschema
+
+        ovsdb-server \
+            /etc/openvswitch/conf.db \
+            --remote=punix:/var/run/openvswitch/db.sock \
             --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
-            --pidfile=/var/run/openvswitch/ovsdb-server.pid --detach
+            --pidfile=/var/run/openvswitch/ovsdb-server.pid \
+            --log-file=/var/log/openvswitch/ovsdb-server.log \
+            --detach --no-chdir
         sleep 1
+
         ovs-vsctl --no-wait init
-        ovs-vswitchd --pidfile=/var/run/openvswitch/ovs-vswitchd.pid --detach
-        sleep 1
+
+        ovs-vswitchd \
+            --pidfile=/var/run/openvswitch/ovs-vswitchd.pid \
+            --log-file=/var/log/openvswitch/ovs-vswitchd.log \
+            --detach --no-chdir \
+            unix:/var/run/openvswitch/db.sock
+
+        for i in \$(seq 1 10); do
+            ovs-vsctl show >/dev/null 2>&1 && break
+            sleep 1
+        done
+
         ovs-vsctl add-br br0
         ovs-vsctl set bridge br0 fail-mode=standalone
+        ovs-vsctl set bridge br0 datapath_type=netdev
     "
     docker exec $CORE bash -c "
         ip link set $ACCESS_IF up
@@ -111,13 +173,12 @@ configure_ovs_core() {
         ovs-vsctl add-port br0 $ACCESS_IF
     "
     docker exec $CORE ip link set br0 up
-
     docker exec $CORE bash -c "
-    ip addr del $GW_IP dev br0 2>/dev/null || true
-    for i in 1 2 3; do
-        ip addr add $GW_IP dev br0 && break
-        sleep 1
-    done
+        ip addr del $GW_IP dev br0 2>/dev/null || true
+        for i in 1 2 3; do
+            ip addr add $GW_IP dev br0 && break
+            sleep 1
+        done
     "
     log "$CORE: gateway $GW_IP assigned to br0"
 }
