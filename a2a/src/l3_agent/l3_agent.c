@@ -82,51 +82,48 @@ static route_entry_t *find_alternate(l3_agent_ctx_t *ctx,
  *
  * Falls back to output:normal when ARP is not yet resolved.
  */
-void install_route_flow(l3_agent_ctx_t *ctx,
-                        const route_entry_t *r)
+void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
 {
     char nexthop_mac[18] = "";
     char local_mac[18] = "";
     int out_port = -1;
 
+    /* If egress interface is not in OVS (e.g., core router transit links
+     * like c1c2, c1r1), skip OpenFlow flow installation entirely.
+     * The kernel routing table (OSPF/FRR) handles forwarding correctly.
+     * Installing a flow that falls back to output:NORMAL would send the
+     * packet to all OVS ports rather than through the kernel route. */
+    if (r->egress_ifname[0]) {
+        out_port = ovsdb_get_ofport(r->egress_ifname);
+        if (out_port <= 0) {
+            LOG_D("L3", "[%s] Skipping flow for %s: egress '%s' not in OVS "
+                  "(kernel routing handles this)",
+                  ctx->switch_id, r->prefix, r->egress_ifname);
+            return;
+        }
+    }
+
     int arp_ok = (l3_arp_resolve(r->nexthop, nexthop_mac,
                                  sizeof(nexthop_mac)) == 0);
-
     int mac_ok = (l3_get_local_mac(ctx->bridge, local_mac,
                                    sizeof(local_mac)) == 0);
 
-    if (!arp_ok)
-    {
+    if (!arp_ok) {
         LOG_W("L3", "ARP miss for %s", r->nexthop);
-    }
-
-    if (r->egress_ifname[0])
-    {
-        out_port = ovsdb_get_ofport(r->egress_ifname);
     }
 
     ovs_flow_t fl = {0};
     fl.priority = 100;
+    snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
 
-    snprintf(fl.match, sizeof(fl.match),
-             "ip,nw_dst=%s", r->prefix);
-
-    if (arp_ok && mac_ok && out_port > 0 && out_port < (int)0xFFFFFFF0)
-    {
+    if (arp_ok && mac_ok && out_port > 0 && out_port < (int)0xFFFFFFF0) {
         snprintf(fl.actions, sizeof(fl.actions),
                  "dec_ttl,mod_dl_dst:%s,mod_dl_src:%s,output:%d",
                  nexthop_mac, local_mac, out_port);
-
         LOG_I("L3", "Flow installed: %s via %s out_port=%d",
               r->prefix, nexthop_mac, out_port);
-    }
-    else
-    {
-        /* output:NORMAL uses OVS MAC-learning table as fallback while ARP
-         * resolves.  output:CONTROLLER drops traffic when no controller
-         * is connected (fail-mode=standalone). */
+    } else {
         snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
-
         LOG_W("L3", "Fallback → NORMAL (ARP pending) for %s: arp_ok=%d mac_ok=%d port=%d",
               r->prefix, arp_ok, mac_ok, out_port);
     }

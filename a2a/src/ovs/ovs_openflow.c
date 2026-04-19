@@ -907,6 +907,58 @@ static int of_reconnect(const char *bridge)
     return fd;
 }
 
+int ovs_of_add_meter(const char *bridge, uint32_t meter_id, uint32_t rate_kbps)
+{
+    int fd = ovs_of_connect(bridge);
+    if (fd < 0) return -1;
+
+    /*
+     * OFPT_METER_MOD: ADD meter with OFPMBT_DROP band at rate_kbps kbps.
+     * Wire format:
+     *   ofp_header(8) + command(2) + flags(2) + meter_id(4)
+     *   + ofp_meter_band_drop: type(2)+len(2)+rate(4)+burst(4)+pad(4)
+     */
+    uint8_t buf[64] = {0};
+    int off = 0;
+
+    /* Header */
+    buf[0] = OFP13_VERSION;
+    buf[1] = 29;            /* OFPT_METER_MOD */
+    /* length filled later */
+    uint32_t xid = htonl(g_xid++);
+    memcpy(buf + 4, &xid, 4);
+    off = 8;
+
+    /* command=ADD(0), flags=KBPS(1) */
+    uint16_t cmd = htons(0);   /* OFPMC_ADD */
+    uint16_t flags = htons(1); /* OFPMF_KBPS */
+    memcpy(buf + off, &cmd,   2); off += 2;
+    memcpy(buf + off, &flags, 2); off += 2;
+    uint32_t mid = htonl(meter_id);
+    memcpy(buf + off, &mid, 4); off += 4;
+
+    /* Band: OFPMBT_DROP=1 */
+    uint16_t btype = htons(1);       /* DROP */
+    uint16_t blen  = htons(16);      /* fixed */
+    uint32_t brate = htonl(rate_kbps);
+    uint32_t bburst = htonl(rate_kbps / 10); /* 10% burst */
+    memcpy(buf + off, &btype,  2); off += 2;
+    memcpy(buf + off, &blen,   2); off += 2;
+    memcpy(buf + off, &brate,  4); off += 4;
+    memcpy(buf + off, &bburst, 4); off += 4;
+    off += 4; /* pad */
+
+    uint16_t total = htons((uint16_t)off);
+    memcpy(buf + 2, &total, 2);
+
+    if (send(fd, buf, off, MSG_NOSIGNAL) < 0) {
+        LOG_E("OF", "[%s] METER_MOD ADD failed errno=%d", bridge, errno);
+        return -1;
+    }
+    LOG_I("OF", "[%s] Meter %u installed rate=%u kbps", bridge, meter_id, rate_kbps);
+    return 0;
+}
+
 /* ── Public flow management API ──────────────────────────────────── */
 
 int ovs_of_add_flow(const char *bridge, const ovs_flow_t *flow)
@@ -1102,7 +1154,7 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
      *   + [packet data if no buffer]
      */
     int total = 8 + 4 + 4 + 2 + 6 + (int)sizeof(ofp_action_output_t) + data_len;
-    if (total > 2048)
+    if (total > 65600)
         return; /* safety */
 
     uint8_t buf[2048] = {0};
@@ -1144,85 +1196,96 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
     send(fd, buf, off, MSG_NOSIGNAL);
 }
 
+/* Replace ovs_of_process_packet_in entirely: */
+
 void ovs_of_process_packet_in(const char *bridge, int fd)
 {
-    uint8_t buf[2048];
-    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n <= 0)
-        return;
+    /* Drain all available messages from this fd */
+    for (;;) {
+        uint8_t buf[65600];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0)
+            return;
 
-    ofp_header_t *hdr = (ofp_header_t *)buf;
-    if (hdr->version != OFP13_VERSION)
-        return;
-    if (hdr->type != OFPT_PACKET_IN)
-        return;
-    if (n < (ssize_t)sizeof(ofp_header_t))
-        return;
+        if (n < (ssize_t)sizeof(ofp_header_t))
+            return;
 
-    uint16_t total_len = ntohs(hdr->length);
-    if (n < total_len)
-        return;
+        ofp_header_t *hdr = (ofp_header_t *)buf;
+        if (hdr->version != OFP13_VERSION)
+            continue;
 
-    /* OF1.3 PACKET_IN fixed fields after header:
-     *   buffer_id(4) + total_len(2) + reason(1) + table_id(1) + cookie(8) = 16 bytes */
-    if (total_len < 24)
-        return;
+        uint16_t total_len = ntohs(hdr->length);
+        if ((ssize_t)n < total_len)
+            return;  /* partial message — shouldn't happen with MSG_DONTWAIT */
 
-    uint32_t buffer_id;
-    memcpy(&buffer_id, buf + 8, 4);
-    buffer_id = ntohl(buffer_id);
-
-    int match_off = 24;
-    if (match_off + 4 > total_len)
-        return;
-
-    ofp_match_t *match = (ofp_match_t *)(buf + match_off);
-    uint16_t mlen = ntohs(match->length);
-    if (match_off + mlen > total_len)
-        return;
-
-    uint32_t in_port = OFPP_ANY;
-    int oxm_off = match_off + 4;
-    int oxm_end = match_off + (int)mlen;
-
-    while (oxm_off + 4 <= oxm_end)
-    {
-        const uint8_t *oxm_bytes = buf + oxm_off;
-        uint8_t vlen = oxm_bytes[3]; /* FIX B1 */
-        uint16_t cls = ((uint16_t)oxm_bytes[0] << 8) | oxm_bytes[1];
-        uint8_t field_byte = oxm_bytes[2];
-        uint32_t field = ((uint32_t)cls << 16) |
-                         ((uint32_t)(field_byte >> 1) << 9) |
-                         ((uint32_t)(field_byte & 1) << 8);
-
-        if (field == (OXM_OF_IN_PORT & ~0xFF) && vlen == 4)
-        {
-            uint32_t port_be;
-            memcpy(&port_be, buf + oxm_off + 4, 4);
-            in_port = ntohl(port_be);
+        /* Handle ECHO_REQUEST — critical for controller liveness */
+        if (hdr->type == 2) {  /* OFPT_ECHO_REQUEST */
+            ofp_header_t reply;
+            reply.version = OFP13_VERSION;
+            reply.type = 3;  /* OFPT_ECHO_REPLY */
+            reply.length = hdr->length;
+            reply.xid = hdr->xid;
+            send(fd, &reply, sizeof(reply), MSG_NOSIGNAL);
+            LOG_D("OF", "[%s] ECHO_REPLY sent", bridge);
+            continue;
         }
-        oxm_off += 4 + vlen;
+
+        if (hdr->type != OFPT_PACKET_IN)
+            continue;
+
+        if (total_len < 24)
+            continue;
+
+        uint32_t buffer_id;
+        memcpy(&buffer_id, buf + 8, 4);
+        buffer_id = ntohl(buffer_id);
+
+        int match_off = 24;
+        if (match_off + 4 > total_len)
+            continue;
+
+        ofp_match_t *match = (ofp_match_t *)(buf + match_off);
+        uint16_t mlen = ntohs(match->length);
+        if (match_off + mlen > total_len)
+            continue;
+
+        uint32_t in_port = OFPP_ANY;
+        int oxm_off = match_off + 4;
+        int oxm_end = match_off + (int)mlen;
+
+        while (oxm_off + 4 <= oxm_end) {
+            const uint8_t *oxm_bytes = buf + oxm_off;
+            uint8_t vlen = oxm_bytes[3];
+            uint16_t cls = ((uint16_t)oxm_bytes[0] << 8) | oxm_bytes[1];
+            uint8_t field_byte = oxm_bytes[2];
+            uint32_t field = ((uint32_t)cls << 16) |
+                             ((uint32_t)(field_byte >> 1) << 9) |
+                             ((uint32_t)(field_byte & 1) << 8);
+
+            if (field == (OXM_OF_IN_PORT & ~0xFF) && vlen == 4) {
+                uint32_t port_be;
+                memcpy(&port_be, buf + oxm_off + 4, 4);
+                in_port = ntohl(port_be);
+            }
+            oxm_off += 4 + vlen;
+        }
+
+        int pkt_off = match_off + ((mlen + 7) & ~7);
+        if (pkt_off + 14 > total_len)
+            continue;
+
+        const uint8_t *pkt = buf + pkt_off;
+        int pkt_len = total_len - pkt_off;
+
+        if (in_port != OFPP_ANY) {
+            of_send_packet_out_flood(fd, buffer_id, in_port,
+                                     pkt,
+                                     (buffer_id != OFP_NO_BUFFER) ? 0 : pkt_len);
+        }
+
+        const uint8_t *eth_src = pkt + 6;
+        mac_table_learn(eth_src, in_port, bridge);
     }
-
-    /* Packet data starts after match, padded to 8-byte boundary */
-    int pkt_off = match_off + ((mlen + 7) & ~7);
-    if (pkt_off + 14 > total_len)
-        return;
-
-    const uint8_t *pkt = buf + pkt_off;
-    int pkt_len = total_len - pkt_off;
-
-    /*  Flood the original frame immediately so ARP/unknown traffic
-     * is not silently dropped at the controller. */
-    if (in_port != OFPP_ANY)
-    {
-        of_send_packet_out_flood(fd, buffer_id, in_port,
-                                 pkt, (buffer_id != OFP_NO_BUFFER) ? 0 : pkt_len);
-    }
-
-    /* Learn the source MAC */
-    const uint8_t *eth_src = pkt + 6;
-    mac_table_learn(eth_src, in_port, bridge);
 }
 
 /* Public accessor for ovs_interface.c */

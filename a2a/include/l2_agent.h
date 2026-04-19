@@ -55,7 +55,7 @@ typedef struct
     uint32_t flows_installed;
     uint32_t l3_notifies_sent;
 
-    char ovsdb_buf[8192];
+    char ovsdb_buf[262144];
     size_t ovsdb_len;
 } l2_agent_ctx_t;
 

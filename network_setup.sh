@@ -71,8 +71,8 @@ configure_ovs_switch() {
         ovs-vswitchd --pidfile=/var/run/openvswitch/ovs-vswitchd.pid --detach
         sleep 1
         ovs-vsctl add-br br0
-        ovs-vsctl set bridge br0 fail-mode=standalone
-        ovs-ofctl add-flow br0 "priority=0,actions=NORMAL"
+        ovs-vsctl set bridge br0 fail-mode=secure
+        
     "
     for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0)$'); do
         docker exec $SW bash -c "ip link set $iface up; ovs-vsctl --if-exists del-port br0 $iface; ovs-vsctl add-port br0 $iface"
