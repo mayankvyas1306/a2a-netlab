@@ -53,47 +53,12 @@ create_link r3 r3r4 r4 r4r3
 create_link r4 r4r1 r1 r1r4
 
 
-
 echo "STEP 2: CONFIGURING OVS SWITCHES"
 configure_ovs_switch() {
     SW=$1
     log "Configuring OVS on $SW"
     docker exec $SW bash -c "
-        mkdir -p /var/run/openvswitch /etc/openvswitch
-        if [ ! -f /etc/openvswitch/conf.db ]; then
-            ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
-        fi
-        ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
-            --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
-            --pidfile=/var/run/openvswitch/ovsdb-server.pid --detach
-        sleep 1
-        ovs-vsctl --no-wait init
-        ovs-vswitchd --pidfile=/var/run/openvswitch/ovs-vswitchd.pid --detach
-        sleep 1
-        ovs-vsctl add-br br0
-        ovs-vsctl set bridge br0 fail-mode=secure
-        
-    "
-    for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0)$'); do
-        docker exec $SW bash -c "ip link set $iface up; ovs-vsctl --if-exists del-port br0 $iface; ovs-vsctl add-port br0 $iface"
-        log "$SW: added port $iface"
-    done
-    docker exec $SW ip link set br0 up
-}
-for i in {1..8}; do configure_ovs_switch sw$i; done
-
-# Core routers need OVS only for the A2A agent (OVSDB monitoring + flow install).
-# Their transit interfaces (cXcY, cXrY) MUST stay as plain kernel L3 interfaces
-# so OSPF hello packets are processed by the kernel IP stack.
-# Adding c1c2/c1r1/etc. to OVS br0 would make them L2 switch ports and
-# prevent OSPF adjacency from forming — that is the root cause of OSPF=0.
-configure_ovs_core() {
-    CORE=$1
-    ACCESS_IF=$2   # Only this interface goes into br0 (faces the L2 access domain)
-    GW_IP=$3
-    log "Configuring OVS on $CORE (access-only: $ACCESS_IF)"
-    docker exec $CORE bash -c "
-        mkdir -p /var/run/openvswitch /etc/openvswitch
+        mkdir -p /var/run/openvswitch /etc/openvswitch /var/log/openvswitch
         if [ ! -f /etc/openvswitch/conf.db ]; then
             ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
         fi
@@ -107,9 +72,39 @@ configure_ovs_core() {
         ovs-vsctl add-br br0
         ovs-vsctl set bridge br0 fail-mode=standalone
     "
-    # Add ONLY the access-side interface to br0.
-    # All inter-core (c1c2, c2c3, c3c4) and uplink (c1r1..c4r4) interfaces
-    # are intentionally left outside OVS so the kernel can route on them.
+    # FIX: use fail-mode=standalone so basic L2 forwarding works even before
+    # the A2A agent connects. The agent installs higher-priority flows on top.
+    for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0)$'); do
+        docker exec $SW bash -c "ip link set $iface up; ovs-vsctl --if-exists del-port br0 $iface; ovs-vsctl add-port br0 $iface"
+        log "$SW: added port $iface"
+    done
+    docker exec $SW ip link set br0 up
+}
+for i in {1..8}; do configure_ovs_switch sw$i; done
+
+# Core routers need OVS only for the A2A agent (OVSDB monitoring + flow install).
+# Their transit interfaces (cXcY, cXrY) MUST stay as plain kernel L3 interfaces
+# so OSPF hello packets are processed by the kernel IP stack.
+configure_ovs_core() {
+    CORE=$1
+    ACCESS_IF=$2   # Only this interface goes into br0 (faces the L2 access domain)
+    GW_IP=$3
+    log "Configuring OVS on $CORE (access-only: $ACCESS_IF)"
+    docker exec $CORE bash -c "
+        mkdir -p /var/run/openvswitch /etc/openvswitch /var/log/openvswitch
+        if [ ! -f /etc/openvswitch/conf.db ]; then
+            ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
+        fi
+        ovsdb-server --remote=punix:/var/run/openvswitch/db.sock \
+            --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
+            --pidfile=/var/run/openvswitch/ovsdb-server.pid --detach
+        sleep 1
+        ovs-vsctl --no-wait init
+        ovs-vswitchd --pidfile=/var/run/openvswitch/ovs-vswitchd.pid --detach
+        sleep 1
+        ovs-vsctl add-br br0
+        ovs-vsctl set bridge br0 fail-mode=standalone
+    "
     docker exec $CORE bash -c "
         ip link set $ACCESS_IF up
         ovs-vsctl --if-exists del-port br0 $ACCESS_IF
@@ -173,7 +168,6 @@ docker exec r1 bash -c "ip addr add 100.0.2.14/30 dev r1r4"
 
 
 # Ensure all transit (inter-core + uplink) interfaces are UP as kernel L3.
-# These were NOT added to OVS, so they need an explicit 'ip link set up'.
 for PAIR in core1:c1c2 core1:c1r1 core2:c2c1 core2:c2c3 core2:c2r2 \
             core3:c3c2 core3:c3c4 core3:c3r3 core4:c4c3 core4:c4r4; do
     C="${PAIR%%:*}"; IF="${PAIR##*:}"
