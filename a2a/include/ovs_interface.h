@@ -52,6 +52,14 @@ int ovs_set_port_state(const char *bridge,
 /* Bridge */
 int ovs_bridge_exists(const char *bridge);
 
+/*
+ * Meter management (OpenFlow 1.3 METER_MOD).
+ * Creates/replaces a DROP meter with the given rate in kbps.
+ * Called by POLICY_RATE_LIMIT before installing the metered flow.
+ */
+int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
+                     uint32_t rate_kbps);
+
 /* Require including a2a_transport.h before this if using epoll functions */
 struct a2a_server;
 void ovs_of_register_epoll  (struct a2a_server *server);
