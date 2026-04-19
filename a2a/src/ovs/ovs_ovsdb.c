@@ -31,6 +31,8 @@
 /* ── In-memory shadow of OVS Interface table ─────────────────────── */
 #define OVSDB_MAX_IFACES 128
 
+/* Forward declaration — defined in l2_agent.c */
+void l2_sync_ports_from_ovsdb(l2_agent_ctx_t *ctx);
 
 
 typedef struct
@@ -539,7 +541,9 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent)
     if (iface_tbl)
         process_interface_table(iface_tbl, agent);
 
-    
+    cJSON *port_tbl = cJSON_GetObjectItem(tables, "Port");
+    if (port_tbl)
+        process_port_table(port_tbl, agent);
 
     /* After Interface table update, re-sync L2 port list from OVSDB shadow.
      * This is how OVS ports are discovered at runtime — sysfs brif/ is empty
@@ -547,7 +551,6 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent)
     if (iface_tbl && agent && agent->card.type == AGENT_TYPE_L2 &&
         agent->userdata)
     {
-        extern void l2_sync_ports_from_ovsdb(l2_agent_ctx_t * ctx);
         l2_sync_ports_from_ovsdb((l2_agent_ctx_t *)agent->userdata);
         check_link_state_changes(agent);
     }

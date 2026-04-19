@@ -18,7 +18,7 @@
 #include "a2a_log.h"
 
 #define MAX_EVENTS 64
-#define RECV_BUF 8192
+#define RECV_BUF 65540
 #define MAX_CLIENT_FDS 256
 #define MAX_MSG_BYTES 65536u /* hard cap: reject oversized frames */
 #define MAX_EXT_FDS 16

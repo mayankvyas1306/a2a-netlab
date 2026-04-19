@@ -220,6 +220,7 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 
                 case POLICY_RATE_LIMIT:
                 {
+                    ovs_of_add_meter(ctx->bridge, 1, pl.rate_limit * 2);
                     ovs_flow_t fl = {0};
                     fl.priority = 200;
                     snprintf(fl.match, sizeof(fl.match),
