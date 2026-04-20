@@ -38,6 +38,7 @@ void l2_sync_ports_from_ovsdb(l2_agent_ctx_t *ctx);
 typedef struct
 {
     char name[64];
+    char uuid[64];
     int ofport;
     int link_up;
     uint64_t rx_packets;
@@ -202,15 +203,18 @@ int ovsdb_send_monitor(int fd)
  */
 static const char *ovsdb_str(cJSON *item)
 {
-    if (!item)
-        return NULL;
-    if (cJSON_IsString(item))
-        return item->valuestring;
+    if (!item) return NULL;
+    if (cJSON_IsString(item)) return item->valuestring;
     if (cJSON_IsArray(item) && cJSON_GetArraySize(item) == 2)
     {
         cJSON *val = cJSON_GetArrayItem(item, 1);
-        if (cJSON_IsString(val))
-            return val->valuestring;
+        if (cJSON_IsString(val)) return val->valuestring;
+        
+        /* FIX: Handle OVSDB ["set", ["string"]] arrays for Link States */
+        if (cJSON_IsArray(val) && cJSON_GetArraySize(val) == 1) {
+            cJSON *inner = cJSON_GetArrayItem(val, 0);
+            if (cJSON_IsString(inner)) return inner->valuestring;
+        }
     }
     return NULL;
 }
@@ -267,79 +271,102 @@ static void parse_statistics_map(cJSON *jstats, ovsdb_iface_shadow_t *iface)
 
 static void process_interface_table(cJSON *iface_table, a2a_agent_t *agent)
 {
-    if (!iface_table)
-        return;
+    if (!iface_table) return;
 
     cJSON *entry = NULL;
     cJSON_ArrayForEach(entry, iface_table)
     {
         cJSON *new_obj = cJSON_GetObjectItem(entry, "new");
-        if (!new_obj)
-            continue;
+        if (!new_obj) continue;
 
+        const char *uuid = entry->string;
         cJSON *jname  = cJSON_GetObjectItem(new_obj, "name");
         cJSON *jstats = cJSON_GetObjectItem(new_obj, "statistics");
         cJSON *jofp   = cJSON_GetObjectItem(new_obj, "ofport");
         cJSON *jlink  = cJSON_GetObjectItem(new_obj, "link_state");
 
-        const char *ifname = ovsdb_str(jname);
-        if (!ifname || !ifname[0])
-            continue;
+        const char *ifname = NULL;
+        if (jname && cJSON_IsString(jname)) ifname = jname->valuestring;
+        
+        ovsdb_iface_shadow_t *iface = NULL;
 
-        ovsdb_iface_shadow_t *iface = iface_find_or_alloc(ifname);
-        if (!iface)
-        {
-            LOG_W("OVSDB", "Interface shadow table full, dropping %s", ifname);
-            continue;
-        }
-
-        int was_up = iface->link_up; /* save previous state */
-
-        if (jstats) parse_statistics_map(jstats, iface);
-
-        if (jofp)
-        {
-            if (cJSON_IsNumber(jofp))
-                iface->ofport = (int)jofp->valuedouble;
-            else if (cJSON_IsArray(jofp) && cJSON_GetArraySize(jofp) == 2)
-            {
-                cJSON *v = cJSON_GetArrayItem(jofp, 1);
-                if (cJSON_IsNumber(v))
-                    iface->ofport = (int)v->valuedouble;
+        if (ifname && ifname[0]) {
+            iface = iface_find_or_alloc(ifname);
+            if (iface && uuid) {
+                strncpy(iface->uuid, uuid, sizeof(iface->uuid) - 1);
+            }
+        } else if (uuid && uuid[0]) {
+            for (int i = 0; i < OVSDB_MAX_IFACES; i++) {
+                if (g_ifaces[i].valid && strcmp(g_ifaces[i].uuid, uuid) == 0) {
+                    iface = &g_ifaces[i];
+                    break;
+                }
             }
         }
 
-        const char *ls = ovsdb_str(jlink);
-        if (ls)
-            iface->link_up = (strcmp(ls, "up") == 0);
+        if (!iface) continue;
+        int was_up = iface->link_up;
+        int prev_ofport = iface->ofport;
+
+        if (jstats) parse_statistics_map(jstats, iface);
+
+        if (jofp) {
+            if (cJSON_IsNumber(jofp)) iface->ofport = (int)jofp->valuedouble;
+            else if (cJSON_IsArray(jofp) && cJSON_GetArraySize(jofp) == 2) {
+                cJSON *v = cJSON_GetArrayItem(jofp, 1);
+                if (cJSON_IsNumber(v)) iface->ofport = (int)v->valuedouble;
+            } else {
+                iface->ofport = -1;
+            }
+        }
+
+        /* PERFECT PARSING: Catch the ["set", []] empty array meaning DOWN */
+        int is_up = 1;
+        if (jlink) {
+            if (cJSON_IsString(jlink) && strcmp(jlink->valuestring, "up") == 0) {
+                is_up = 1;
+            } else if (cJSON_IsArray(jlink) && cJSON_GetArraySize(jlink) == 2) {
+                cJSON *val = cJSON_GetArrayItem(jlink, 1);
+                if (cJSON_IsArray(val) && cJSON_GetArraySize(val) == 0) {
+                    is_up = 0; /* Empty array -> explicitly DOWN */
+                } else if (cJSON_IsArray(val) && cJSON_GetArraySize(val) == 1) {
+                    cJSON *inner = cJSON_GetArrayItem(val, 0);
+                    if (cJSON_IsString(inner) && strcmp(inner->valuestring, "up") == 0) {
+                        is_up = 1;
+                    } else {
+                        is_up = 0;
+                    }
+                } else if (cJSON_IsString(val) && strcmp(val->valuestring, "up") == 0) {
+                    is_up = 1;
+                } else {
+                    is_up = 0;
+                }
+            } else {
+                is_up = 0;
+            }
+        }
+        iface->link_up = is_up;
+        int port_no = iface->ofport > 0 ? iface->ofport : prev_ofport;
 
         LOG_D("OVSDB", "Interface updated: %s ofport=%d link=%s",
-              ifname, iface->ofport, iface->link_up ? "up" : "down");
+              iface->name, port_no, iface->link_up ? "up" : "down");
 
-        /* FIX B6: Fire link-down event when state transitions up→down.
-         * This works because Interface.link_state IS reliably updated by OVS. */
-        if (was_up && !iface->link_up && agent &&
-            agent->card.type == AGENT_TYPE_L2 && agent->userdata)
-        {
+        if (was_up && !iface->link_up && agent && agent->card.type == AGENT_TYPE_L2 && agent->userdata) {
             l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;
-            int port_no = iface->ofport;
-            if (port_no > 0)
-            {
-                LOG_W("OVSDB", "LINK DOWN: if=%s ofport=%d", ifname, port_no);
+            if (port_no > 0) {
+                LOG_W("OVSDB", "LINK DOWN: if=%s ofport=%d", iface->name, port_no);
                 a2a_event_t ev = {0};
                 ev.type = A2A_EV_OVS_LINK_DOWN;
                 ev.fsm_event = FSM_EVENT_OVS_EVENT;
                 ev.timestamp_us = a2a_now_us();
                 ev.data.ovs.port = port_no;
                 ev.data.ovs.link_down = 1;
-                snprintf(ev.data.ovs.bridge, sizeof(ev.data.ovs.bridge),
-                         "%s", ctx->bridge);
+                snprintf(ev.data.ovs.bridge, sizeof(ev.data.ovs.bridge), "%s", ctx->bridge);
                 event_queue_push(&agent->eq, &ev);
             }
         }
     }
 }
-
 static void check_link_state_changes(a2a_agent_t *agent)
 {
     if (!agent || !agent->userdata) return;

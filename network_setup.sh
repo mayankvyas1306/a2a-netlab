@@ -104,7 +104,7 @@ configure_ovs_switch() {
     "
     #  use fail-mode=standalone so basic L2 forwarding works even before
     # the A2A agent connects. The agent installs higher-priority flows on top.
-    for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0)$'); do
+    for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0|ovs-netdev)$'); do
         docker exec $SW bash -c "ip link set $iface up; ovs-vsctl --if-exists del-port br0 $iface; ovs-vsctl add-port br0 $iface"
         log "$SW: added port $iface"
     done

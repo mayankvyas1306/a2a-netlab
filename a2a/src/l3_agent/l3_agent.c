@@ -963,6 +963,17 @@ static void l3_ovsdb_epoll_handler(int fd, void *ud)
             ovsdb_process_update(p, ctx->agent);
         p = nl + 1;
     }
+    /* Fallback: process complete JSON object without trailing newline */
+    size_t remaining = (size_t)(buf + n - p);
+    if (remaining > 0 && p[0] == '{') {
+        int depth = 0, complete = 0;
+        for (size_t i = 0; i < remaining; i++) {
+            if (p[i] == '{') depth++;
+            else if (p[i] == '}') { if (--depth == 0) { complete = 1; break; } }
+        }
+        if (complete)
+            ovsdb_process_update(p, ctx->agent);
+    }
 }
 
 l3_agent_ctx_t *l3_agent_create(const char *agent_id,
