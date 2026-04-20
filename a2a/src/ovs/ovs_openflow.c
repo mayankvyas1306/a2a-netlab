@@ -933,32 +933,29 @@ static void mac_table_learn(const uint8_t *eth_src, uint32_t in_port,
 }
 
 /*
- * FIX B9: PACKET_OUT flood uses dynamically allocated buffer to avoid
+ * PACKET_OUT flood uses dynamically allocated buffer to avoid
  * the 2048-byte stack overflow when pkt_len is large.
  */
 static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
                                      uint32_t in_port,
                                      const uint8_t *pkt_data, int pkt_len)
 {
-    /* Always include packet data and use OFP_NO_BUFFER.
-     * With netdev userspace datapath, OVS buffers expire in <5ms —
-     * by the time epoll processes the event, the buffer is gone.
-     * Sending the full packet inline is the only reliable path. */
     (void)buffer_id;
     int data_len = pkt_len;
     buffer_id = OFP_NO_BUFFER;
-    int total = 8 + 4 + 4 + 2 + 6 + (int)sizeof(ofp_action_output_t) + data_len;
+    
+    int base_total = 8 + 4 + 4 + 2 + 6 + (int)sizeof(ofp_action_output_t) + data_len;
+    
+    /* OpenFlow 1.3 messages MUST be padded to an 8-byte boundary */
+    int pad_len = (8 - (base_total % 8)) % 8;
+    int total = base_total + pad_len;
 
-    /* Clamp to a sane maximum (jumbo frames up to 9KB) */
-    if (total > 9216)
-        return;
+    if (total > 9216) return;
 
     uint8_t *buf = calloc(1, total);
-    if (!buf)
-        return;
+    if (!buf) return;
 
     int off = 0;
-
     ofp_header_t *hdr = (ofp_header_t *)buf;
     hdr->version = OFP13_VERSION;
     hdr->type = OFPT_PACKET_OUT;
@@ -987,16 +984,17 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
         memcpy(buf + off, pkt_data, data_len);
         off += data_len;
     }
+    
+    off += pad_len;
 
     send(fd, buf, off, MSG_NOSIGNAL);
     free(buf);
 }
-
 /*
  * ovs_of_process_packet_in — drain all readable OF messages from fd.
  * Handles: ECHO_REQUEST (reply immediately), PACKET_IN (MAC learn + flood).
  *
- * FIX B8: ECHO_REQUEST is now handled so OVS doesn't consider the
+ * ECHO_REQUEST is now handled so OVS doesn't consider the
  * controller dead and sweep its flows.
  */
 void ovs_of_process_packet_in(const char *bridge, int fd)
@@ -1004,34 +1002,25 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
     for (;;) {
         uint8_t hdr_buf[8];
         ssize_t n = recv(fd, hdr_buf, 8, MSG_DONTWAIT | MSG_PEEK);
-        if (n < 8)
-            return; /* nothing or partial header */
+        if (n < 8) return;
 
         ofp_header_t *hdr = (ofp_header_t *)hdr_buf;
         if (hdr->version != OFP13_VERSION) {
-            /* Consume and discard unknown version */
             recv(fd, hdr_buf, 8, MSG_DONTWAIT);
             return;
         }
 
         uint16_t total_len = ntohs(hdr->length);
-        if (total_len < 8)
-            return;
+        if (total_len < 8) return;
 
-        /* Allocate buffer for full message */
         uint8_t *buf = malloc(total_len);
-        if (!buf)
-            return;
+        if (!buf) return;
 
         n = recv(fd, buf, total_len, MSG_DONTWAIT);
-        if (n < total_len) {
-            free(buf);
-            return;
-        }
+        if (n < total_len) { free(buf); return; }
 
         ofp_header_t *msg_hdr = (ofp_header_t *)buf;
 
-        /* Handle ECHO_REQUEST — must reply or OVS sweeps our flows */
         if (msg_hdr->type == OFPT_ECHO_REQUEST) {
             ofp_header_t reply;
             reply.version = OFP13_VERSION;
@@ -1039,19 +1028,13 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             reply.length  = htons(8);
             reply.xid     = msg_hdr->xid;
             send(fd, &reply, sizeof(reply), MSG_NOSIGNAL);
-            LOG_D("OF", "[%s] ECHO_REPLY sent", bridge);
             free(buf);
             continue;
         }
 
         if (msg_hdr->type != OFPT_PACKET_IN || total_len < 24) {
-            free(buf);
-            continue;
+            free(buf); continue;
         }
-
-        uint32_t buffer_id;
-        memcpy(&buffer_id, buf + 8, 4);
-        buffer_id = ntohl(buffer_id);
 
         int match_off = 24;
         if (match_off + 4 > total_len) { free(buf); continue; }
@@ -1066,7 +1049,7 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
 
         while (oxm_off + 4 <= oxm_end) {
             const uint8_t *oxm_bytes = buf + oxm_off;
-            uint8_t vlen = oxm_bytes[3]; /* length of value field */
+            uint8_t vlen = oxm_bytes[3];
             uint16_t cls = ((uint16_t)oxm_bytes[0] << 8) | oxm_bytes[1];
             uint8_t field_byte = oxm_bytes[2];
             uint32_t field = ((uint32_t)cls << 16) |
@@ -1081,19 +1064,28 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             oxm_off += 4 + vlen;
         }
 
-        int pkt_off = match_off + ((mlen + 7) & ~7) + 2;  /* OF1.3: 2-byte pad after match */
-        if (pkt_off + 14 > total_len) { free(buf); continue; }
+        /* STRICT OF1.3 COMPLIANCE: Match padded to 8 bytes, exactly 2 bytes padding */
+        int pkt_off = match_off + ((mlen + 7) & ~7) + 2;
 
-        const uint8_t *pkt = buf + pkt_off;
-        int pkt_len = total_len - pkt_off;
-
-        /* Flood unlearned traffic immediately with full inline data */
-        if (in_port != OFPP_ANY) {
-            of_send_packet_out_flood(fd, OFP_NO_BUFFER, in_port,
-                                     pkt, pkt_len);
+        if (pkt_off >= total_len) {
+            free(buf); continue;
         }
 
-        /* Learn source MAC */
+        uint16_t frame_len;
+        memcpy(&frame_len, buf + 12, 2);
+        frame_len = ntohs(frame_len);
+
+        const uint8_t *pkt = buf + pkt_off;
+        int pkt_len = frame_len; 
+
+        if (pkt_off + pkt_len > total_len) {
+            pkt_len = total_len - pkt_off;
+        }
+
+        if (in_port != OFPP_ANY) {
+            of_send_packet_out_flood(fd, OFP_NO_BUFFER, in_port, pkt, pkt_len);
+        }
+
         if (pkt_len >= 14) {
             const uint8_t *eth_src = pkt + 6;
             mac_table_learn(eth_src, in_port, bridge);
@@ -1102,7 +1094,6 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
         free(buf);
     }
 }
-
 int ovs_of_get_mac_table(ovs_mac_entry_t *out, int max)
 {
     int count = 0;
