@@ -899,21 +899,38 @@ static void l2_ovsdb_epoll_handler(int fd, void *ud)
     ctx->ovsdb_len += n;
     ctx->ovsdb_buf[ctx->ovsdb_len] = '\0';
 
+    /* OVSDB sends one JSON object per message, terminated by '\n'.
+     * However the initial monitor response may be very large and
+     * arrive in chunks. Try newline split first; if none found but
+     * buffer contains a complete JSON object (balanced braces),
+     * process it directly to avoid dropping the initial state dump. */
     char *p = ctx->ovsdb_buf;
     char *nl;
 
     while ((nl = strchr(p, '\n')) != NULL)
     {
         *nl = '\0';
-
         if (nl > p)
             ovsdb_process_update(p, ctx->agent);
-
         p = nl + 1;
     }
 
-    /* move remaining */
-    size_t remaining = ctx->ovsdb_buf + ctx->ovsdb_len - p;
+    /* If no newline found but buffer has content, check for complete JSON */
+    size_t remaining = (size_t)(ctx->ovsdb_buf + ctx->ovsdb_len - p);
+    if (remaining > 0 && p[0] == '{') {
+        /* Count braces to detect complete JSON object */
+        int depth = 0;
+        int complete = 0;
+        for (size_t i = 0; i < remaining; i++) {
+            if (p[i] == '{') depth++;
+            else if (p[i] == '}') { depth--; if (depth == 0) { complete = 1; break; } }
+        }
+        if (complete) {
+            ovsdb_process_update(p, ctx->agent);
+            remaining = 0;
+        }
+    }
+
     memmove(ctx->ovsdb_buf, p, remaining);
     ctx->ovsdb_len = remaining;
 }
