@@ -406,7 +406,7 @@ int ovs_of_connect(const char *bridge)
         ovs_of_add_flow(bridge, &arp_flow);
         LOG_I("OF", "[%s] ARP flood flow installed", bridge);
     }
-
+    
     LOG_I("OF", "[%s] OpenFlow channel open fd=%d", bridge, fd);
     return fd;
 }
@@ -940,7 +940,13 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
                                      uint32_t in_port,
                                      const uint8_t *pkt_data, int pkt_len)
 {
-    int data_len = (buffer_id == OFP_NO_BUFFER) ? pkt_len : 0;
+    /* Always include packet data and use OFP_NO_BUFFER.
+     * With netdev userspace datapath, OVS buffers expire in <5ms —
+     * by the time epoll processes the event, the buffer is gone.
+     * Sending the full packet inline is the only reliable path. */
+    (void)buffer_id;
+    int data_len = pkt_len;
+    buffer_id = OFP_NO_BUFFER;
     int total = 8 + 4 + 4 + 2 + 6 + (int)sizeof(ofp_action_output_t) + data_len;
 
     /* Clamp to a sane maximum (jumbo frames up to 9KB) */
@@ -1075,17 +1081,16 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             oxm_off += 4 + vlen;
         }
 
-        int pkt_off = match_off + ((mlen + 7) & ~7);
+        int pkt_off = match_off + ((mlen + 7) & ~7) + 2;  /* OF1.3: 2-byte pad after match */
         if (pkt_off + 14 > total_len) { free(buf); continue; }
 
         const uint8_t *pkt = buf + pkt_off;
         int pkt_len = total_len - pkt_off;
 
-        /* Flood unlearned traffic immediately */
+        /* Flood unlearned traffic immediately with full inline data */
         if (in_port != OFPP_ANY) {
-            of_send_packet_out_flood(fd, buffer_id, in_port,
-                                     pkt,
-                                     (buffer_id != OFP_NO_BUFFER) ? 0 : pkt_len);
+            of_send_packet_out_flood(fd, OFP_NO_BUFFER, in_port,
+                                     pkt, pkt_len);
         }
 
         /* Learn source MAC */
