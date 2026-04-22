@@ -82,33 +82,39 @@ static route_entry_t *find_alternate(l3_agent_ctx_t *ctx,
  *
  * Falls back to output:normal when ARP is not yet resolved.
  */
+/* Install a flow via OVS for the given route. */
 void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
 {
     char nexthop_mac[18] = "";
     char local_mac[18] = "";
     int out_port = -1;
 
-    /* If egress interface is not in OVS (e.g., core router transit links
-     * like c1c2, c1r1), skip OpenFlow flow installation entirely.
-     * The kernel routing table (OSPF/FRR) handles forwarding correctly.
-     * Installing a flow that falls back to output:NORMAL would send the
-     * packet to all OVS ports rather than through the kernel route. */
-    if (r->egress_ifname[0]) {
+    /* 1. Handle Kernel/System Transit Links (e.g., c1c2) */
+    if (r->egress_ifname[0])
+    {
         out_port = ovsdb_get_ofport(r->egress_ifname);
-        if (out_port <= 0) {
-            LOG_D("L3", "[%s] Skipping flow for %s: egress '%s' not in OVS "
-                  "(kernel routing handles this)",
-                  ctx->switch_id, r->prefix, r->egress_ifname);
+        
+        // If the port isn't in OVS, delegate to the Linux Kernel routing stack
+        if (out_port <= 0)
+        {
+            LOG_I("L3", "[%s] Egress '%s' not in OVS. Installing NORMAL flow for %s",
+                  ctx->switch_id, r->egress_ifname, r->prefix);
+            
+            ovs_flow_t fl = {0};
+            fl.priority = 100;
+            snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
+            snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
+            ovs_add_flow(ctx->bridge, &fl);
             return;
         }
     }
 
-    int arp_ok = (l3_arp_resolve(r->nexthop, nexthop_mac,
-                                 sizeof(nexthop_mac)) == 0);
-    int mac_ok = (l3_get_local_mac(ctx->bridge, local_mac,
-                                   sizeof(local_mac)) == 0);
+    /* 2. Handle OVS-Attached Links */
+    int arp_ok = (l3_arp_resolve(r->nexthop, nexthop_mac, sizeof(nexthop_mac)) == 0);
+    int mac_ok = (l3_get_local_mac(ctx->bridge, local_mac, sizeof(local_mac)) == 0);
 
-    if (!arp_ok) {
+    if (!arp_ok && strcmp(r->nexthop, "0.0.0.0") != 0)
+    {
         LOG_W("L3", "ARP miss for %s", r->nexthop);
     }
 
@@ -116,21 +122,25 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
     fl.priority = 100;
     snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
 
-    if (arp_ok && mac_ok && out_port > 0 && out_port < (int)0xFFFFFFF0) {
+    /* Only rewrite MACs if we have a valid OVS port and ARP resolution */
+    if (arp_ok && mac_ok && out_port > 0 && out_port < (int)0xFFFFFFF0)
+    {
         snprintf(fl.actions, sizeof(fl.actions),
                  "dec_ttl,mod_dl_dst:%s,mod_dl_src:%s,output:%d",
                  nexthop_mac, local_mac, out_port);
         LOG_I("L3", "Flow installed: %s via %s out_port=%d",
               r->prefix, nexthop_mac, out_port);
-    } else {
+    }
+    else
+    {
+        /* 3. CRITICAL FIX: Fallback to NORMAL, not CONTROLLER. 
+           This allows the kernel to answer ARPs for local gateway subnets */
         snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
-        LOG_W("L3", "Fallback → NORMAL (ARP pending) for %s: arp_ok=%d mac_ok=%d port=%d",
-              r->prefix, arp_ok, mac_ok, out_port);
+        LOG_I("L3", "Fallback -> NORMAL flow for %s (Kernel routing will handle)", r->prefix);
     }
 
     ovs_add_flow(ctx->bridge, &fl);
 }
-
 /* Withdraw (delete) the flow for a route */
 void withdraw_route_flow(l3_agent_ctx_t *ctx,
                          const route_entry_t *r)
@@ -965,11 +975,21 @@ static void l3_ovsdb_epoll_handler(int fd, void *ud)
     }
     /* Fallback: process complete JSON object without trailing newline */
     size_t remaining = (size_t)(buf + n - p);
-    if (remaining > 0 && p[0] == '{') {
+    if (remaining > 0 && p[0] == '{')
+    {
         int depth = 0, complete = 0;
-        for (size_t i = 0; i < remaining; i++) {
-            if (p[i] == '{') depth++;
-            else if (p[i] == '}') { if (--depth == 0) { complete = 1; break; } }
+        for (size_t i = 0; i < remaining; i++)
+        {
+            if (p[i] == '{')
+                depth++;
+            else if (p[i] == '}')
+            {
+                if (--depth == 0)
+                {
+                    complete = 1;
+                    break;
+                }
+            }
         }
         if (complete)
             ovsdb_process_update(p, ctx->agent);
