@@ -1177,8 +1177,6 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             continue;
         }
 
-        
-
         const uint8_t *pkt = buf + pkt_off;
         int pkt_len = total_len - pkt_off;
         if (pkt_len < 0)
@@ -1187,7 +1185,11 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             continue;
         }
 
-        if (pkt_len < 14) { free(buf); continue; }
+        if (pkt_len < 14)
+        {
+            free(buf);
+            continue;
+        }
 
         if (in_port != OFPP_ANY)
         {
@@ -1213,7 +1215,8 @@ int ovs_of_get_mac_table(ovs_mac_entry_t *out, int max)
         if (g_mac_table[i].in_port == 0xFFFFFFFE ||
             g_mac_table[i].in_port == 0xFFFFFFFF)
             continue;
-        strncpy(out[count].mac, g_mac_table[i].mac, 17);
+        strncpy(out[count].mac, g_mac_table[i].mac, sizeof(out[count].mac) - 1);
+        out[count].mac[sizeof(out[count].mac) - 1] = '\0';
         out[count].port = (int)g_mac_table[i].in_port;
         out[count].learned_at_us = g_mac_table[i].learned_at_us;
         count++;

@@ -202,17 +202,53 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                 switch (pl.policy_type)
                 {
                 case POLICY_ISOLATE_PORT:
+                {
+                    /*
+                     * Safety guard: never isolate uplink ports (ports connected to
+                     * core routers). Uplink ports are identified as having an
+                     * interface name matching the switch-to-core naming convention
+                     * (e.g., s1c1, s3c2, etc.) or if only one port leads to the
+                     * data-plane gateway.
+                     * Heuristic: skip if ifname contains 'c' followed by a digit
+                     * (s1c1, s3c2, etc.) as those are core uplinks.
+                     */
+                    int is_uplink = 0;
+                    size_t nl = strlen(ifname);
+                    for (size_t ci = 0; ci < nl - 1; ci++)
+                    {
+                        if (ifname[ci] == 'c' && ifname[ci + 1] >= '1' &&
+                            ifname[ci + 1] <= '9')
+                        {
+                            is_uplink = 1;
+                            break;
+                        }
+                    }
+                    if (is_uplink)
+                    {
+                        LOG_W("L2", "[%s] Refusing to isolate uplink port %d (%s) — "
+                                    "applying rate-limit instead",
+                              ctx->switch_id, pl.port, ifname);
+                        /* Downgrade to rate-limit to contain the anomaly */
+                        ovs_of_add_meter(ctx->bridge, 1, 10000); /* 10 Mbps cap */
+                        ovs_flow_t fl = {0};
+                        fl.priority = 200;
+                        snprintf(fl.match, sizeof(fl.match), "in_port=%d", pl.port);
+                        snprintf(fl.actions, sizeof(fl.actions), "meter:1,output:normal");
+                        ovs_add_flow(ctx->bridge, &fl);
+                        LOG_W("L2", "Rate limit applied on uplink port %d instead of isolate",
+                              pl.port);
+                        break;
+                    }
                     ovs_set_port_state(ctx->bridge, ifname, 0);
                     ovs_flow_t drop_fl = {0};
                     drop_fl.priority = 500;
                     snprintf(drop_fl.match, sizeof(drop_fl.match),
                              "in_port=%d", pl.port);
                     snprintf(drop_fl.actions, sizeof(drop_fl.actions), "drop");
-
                     ovs_add_flow(ctx->bridge, &drop_fl);
                     LOG_W("L2", "Port %d isolated", pl.port);
                     break;
-
+                }
                 case POLICY_RESTORE_PORT:
                     ovs_set_port_state(ctx->bridge, ifname, 1);
                     LOG_I("L2", "Port %d restored", pl.port);
@@ -417,6 +453,7 @@ static void on_heartbeat_tick(a2a_agent_t *agent, const a2a_event_t *ev)
 void l2_mac_sync(l2_agent_ctx_t *ctx)
 {
     ovs_mac_entry_t raw[L2_MAX_MAC_TABLE];
+    memset(raw, 0, sizeof(raw));
     int n = ovs_get_mac_table(ctx->bridge, raw, L2_MAX_MAC_TABLE);
     if (n < 0)
         return;
@@ -453,14 +490,30 @@ void l2_mac_sync(l2_agent_ctx_t *ctx)
         }
         if (!found && ctx->mac_count < L2_MAX_MAC_TABLE)
         {
-            mac_entry_t *e = &ctx->mac_table[ctx->mac_count++];
-            memcpy(e->mac, raw[i].mac, 17);
-            e->mac[17] = '\0';
-            e->port = raw[i].port;
-            e->learned_at_us = now;
-            e->last_seen_us = now;
-            e->pkt_count = 1;
-            LOG_I("L2", "New MAC: %s on port %d", e->mac, e->port);
+            /* Final dedup guard: scan one more time with explicit length */
+            int dup = 0;
+            for (int j = 0; j < ctx->mac_count; j++)
+            {
+                if (strncmp(ctx->mac_table[j].mac, raw[i].mac, 17) == 0)
+                {
+                    /* Found via strncmp (length-limited) — update and skip */
+                    ctx->mac_table[j].last_seen_us = now;
+                    ctx->mac_table[j].port = raw[i].port;
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup)
+            {
+                mac_entry_t *e = &ctx->mac_table[ctx->mac_count++];
+                memcpy(e->mac, raw[i].mac, 17);
+                e->mac[17] = '\0';
+                e->port = raw[i].port;
+                e->learned_at_us = now;
+                e->last_seen_us = now;
+                e->pkt_count = 1;
+                LOG_I("L2", "New MAC: %s on port %d", e->mac, e->port);
+            }
         }
     }
 
@@ -491,12 +544,28 @@ void l2_mac_sync(l2_agent_ctx_t *ctx)
      */
 #define MAC_FLOOD_THRESHOLD 50 /* distinct MACs per port per 2s window */
 
+    /* Count UNIQUE MACs per port using a seen-MAC dedup array */
     int per_port[L2_MAX_PORTS];
     memset(per_port, 0, sizeof(per_port));
 
+    /* Dedup: only count each unique MAC once per port in this sync */
     for (int i = 0; i < ctx->mac_count; i++)
     {
         int port = ctx->mac_table[i].port;
+        int counted = 0;
+        /* Check if this MAC has already been counted for this port */
+        for (int k = 0; k < i; k++)
+        {
+            if (ctx->mac_table[k].port == port &&
+                strcmp(ctx->mac_table[k].mac, ctx->mac_table[i].mac) == 0)
+            {
+                counted = 1;
+                break;
+            }
+        }
+        if (counted)
+            continue;
+
         for (int j = 0; j < ctx->port_count; j++)
         {
             if (ctx->ports[j].port_no == port)
@@ -514,7 +583,6 @@ void l2_mac_sync(l2_agent_ctx_t *ctx)
             LOG_W("L2", "[%s] MAC FLOOD DETECTED port=%d distinct_macs=%d",
                   ctx->switch_id, ctx->ports[j].port_no, per_port[j]);
 
-            /* Notify L3 agents exactly as a storm would */
             if (now - ctx->ports[j].last_event_sent_us > 1000000ULL)
             {
                 l2_report_anomaly(ctx,
@@ -535,7 +603,7 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
 {
     port_state_t *ps = &ctx->ports[port_idx];
     uint64_t now = a2a_now_us();
-    
+
     /* Force explicit thresholds to guarantee test visibility with 5000 pkts */
     uint64_t thresh_active = 500;
     uint64_t thresh_clear = 100;
@@ -898,15 +966,27 @@ static void l2_ovsdb_epoll_handler(int fd, void *ud)
 
     /* If no newline found but buffer has content, check for complete JSON */
     size_t remaining = (size_t)(ctx->ovsdb_buf + ctx->ovsdb_len - p);
-    if (remaining > 0 && p[0] == '{') {
+    if (remaining > 0 && p[0] == '{')
+    {
         /* Count braces to detect complete JSON object */
         int depth = 0;
         int complete = 0;
-        for (size_t i = 0; i < remaining; i++) {
-            if (p[i] == '{') depth++;
-            else if (p[i] == '}') { depth--; if (depth == 0) { complete = 1; break; } }
+        for (size_t i = 0; i < remaining; i++)
+        {
+            if (p[i] == '{')
+                depth++;
+            else if (p[i] == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    complete = 1;
+                    break;
+                }
+            }
         }
-        if (complete) {
+        if (complete)
+        {
             ovsdb_process_update(p, ctx->agent);
             remaining = 0;
         }

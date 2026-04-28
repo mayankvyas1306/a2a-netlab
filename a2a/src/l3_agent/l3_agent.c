@@ -93,13 +93,13 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
     if (r->egress_ifname[0])
     {
         out_port = ovsdb_get_ofport(r->egress_ifname);
-        
+
         // If the port isn't in OVS, delegate to the Linux Kernel routing stack
         if (out_port <= 0)
         {
             LOG_I("L3", "[%s] Egress '%s' not in OVS. Installing NORMAL flow for %s",
                   ctx->switch_id, r->egress_ifname, r->prefix);
-            
+
             ovs_flow_t fl = {0};
             fl.priority = 100;
             snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
@@ -133,7 +133,7 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
     }
     else
     {
-        /* 3. CRITICAL FIX: Fallback to NORMAL, not CONTROLLER. 
+        /* 3. CRITICAL FIX: Fallback to NORMAL, not CONTROLLER.
            This allows the kernel to answer ARPs for local gateway subnets */
         snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
         LOG_I("L3", "Fallback -> NORMAL flow for %s (Kernel routing will handle)", r->prefix);
@@ -425,7 +425,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         {
             slot = i;
 
-            if (now - g_anomaly_rate[i].last_action_us < 500000ULL)
+            if (now - g_anomaly_rate[i].last_action_us < 2000000ULL)
                 return;
 
             break;
@@ -464,9 +464,19 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     case L2_ANOMALY_FLOOD:
         LOG_I("L3", "Decision: FLOOD → isolate + reroute");
         l3_reroute_around(ctx, pl.switch_id, pl.port);
-        l3_send_policy(ctx, msg->src_agent,
-                       POLICY_ISOLATE_PORT,
-                       pl.port, NULL, 0);
+        /*
+         * Use RATE_LIMIT instead of ISOLATE_PORT for MAC-flood anomalies.
+         * ISOLATE cuts the port completely (including uplinks), which kills
+         * routing. Rate-limiting contains the flood while preserving
+         * connectivity for legitimate traffic.
+         * Rate = 2x reported pps as headroom for legitimate traffic.
+         */
+        {
+            uint32_t rate = pl.pps > 0 ? pl.pps * 2 : 10000;
+            l3_send_policy(ctx, msg->src_agent,
+                           POLICY_RATE_LIMIT,
+                           pl.port, NULL, rate);
+        }
         break;
 
     case L2_ANOMALY_MAC_SPOOF:
