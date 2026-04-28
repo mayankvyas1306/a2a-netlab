@@ -3,3 +3,5 @@ a2a/build/
 .DS_Store
 
 .env
+
+IMPLEMENTATION_DOCS
