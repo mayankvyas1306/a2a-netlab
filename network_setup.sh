@@ -40,6 +40,10 @@ create_link sw1 s1c1 core1 c1s1
 create_link sw3 s3c2 core2 c2s3
 create_link sw5 s5c3 core3 c3s5
 create_link sw7 s7c4 core4 c4s7
+create_link sw2 s2c1 core1 c1s2
+create_link sw4 s4c2 core2 c2s4
+create_link sw6 s6c3 core3 c3s6
+create_link sw8 s8c4 core4 c4s8
 create_link core1 c1c2 core2 c2c1
 create_link core2 c2c3 core3 c3c2
 create_link core3 c3c4 core4 c4c3
@@ -102,6 +106,7 @@ configure_ovs_switch() {
         ovs-vsctl set bridge br0 fail-mode=standalone
         ovs-vsctl set bridge br0 datapath_type=netdev
     "
+    sleep 2
     #  use fail-mode=standalone so basic L2 forwarding works even before
     # the A2A agent connects. The agent installs higher-priority flows on top.
     for iface in $(docker exec $SW ls /sys/class/net | grep -v -E '^(lo|br0|ovs-system|eth0|ovs-netdev)$'); do
@@ -186,6 +191,18 @@ configure_ovs_core core1 c1s1 10.0.0.254/24
 configure_ovs_core core2 c2s3 20.0.0.254/24
 configure_ovs_core core3 c3s5 30.0.0.254/24
 configure_ovs_core core4 c4s7 40.0.0.254/24
+
+# Secondary uplink ports are L3-only — NOT added to the OVS L2 bridge.
+# Adding c1s2/c2s4/c3s6/c4s8 to br0 (fail-mode=standalone) creates a triangle loop:
+#   sw2 -> core1(c1s2 in) -> core1(c1s1 out) -> sw1 -> sw2
+# The no-flood flag on c1s2 only blocks OUTBOUND floods from c1s2; it does NOT
+# prevent frames arriving INBOUND on c1s2 from being forwarded out c1s1.
+# As plain kernel L3 interfaces, Linux arp_ignore=0 (default) allows core1 to
+# respond to ARP for 10.0.0.254 on c1s2 even though the IP lives on br0.
+docker exec core1 bash -c "ip link set c1s2 up"
+docker exec core2 bash -c "ip link set c2s4 up"
+docker exec core3 bash -c "ip link set c3s6 up"
+docker exec core4 bash -c "ip link set c4s8 up"
 
 echo "STEP 3: CONFIGURING IPs"
 docker exec host1  bash -c "ip addr add 10.0.0.1/24  dev h1s1"

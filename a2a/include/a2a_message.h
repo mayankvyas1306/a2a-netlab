@@ -135,7 +135,8 @@ typedef enum {
     L2_ANOMALY_FLOOD = 2,
     L2_ANOMALY_MAC_SPOOF = 3,
     L2_ANOMALY_LINK_DOWN = 4,
-    L2_ANOMALY_STORM_CLEAR = 5
+    L2_ANOMALY_STORM_CLEAR = 5,
+    L2_ANOMALY_LINK_UP     = 6
 } l2_anomaly_type_t;
 
 

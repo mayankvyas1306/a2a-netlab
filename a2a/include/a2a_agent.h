@@ -31,10 +31,35 @@ typedef struct {
     char         switch_id[A2A_MAX_AGENT_ID];
     char         host[A2A_MAX_HOST_LEN];
     int          port;
+
+    /*
+     * Last successful heartbeat received from peer.
+     */
     uint64_t     last_heartbeat_us;
-    uint64_t     last_send_attempt_us; /* throttle dead-peer probe sends */
+
+    /*
+     * Throttle repeated reconnect attempts toward dead peers.
+     */
+    uint64_t     last_send_attempt_us;
+
+    /*
+     * Timestamp when peer was first registered.
+     */
     uint64_t     registered_at_us;
+
+    /*
+     * Timestamp when peer transitioned alive→dead.
+     *
+     * Used for delayed eviction/grace-period recovery.
+     * 0 means peer is currently alive.
+     */
+    uint64_t     tombstone_us;
+
+    /*
+     * Current liveness state.
+     */
     int          alive;
+
 } agent_peer_t;
 
 typedef struct {

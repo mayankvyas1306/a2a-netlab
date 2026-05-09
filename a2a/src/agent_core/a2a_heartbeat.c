@@ -163,12 +163,37 @@ void heartbeat_check_peers(a2a_agent_t *agent)
 
         if (p->alive && age > PEER_TIMEOUT_US)
         {
-            /* Transition: healthy → timed-out */
-            p->alive = 0;
-            /* p->timeout_fired is not reset here — set below */
+            /*
+             * Transition:
+             *   healthy → timed-out
+             *
+             * Do NOT immediately evict the peer.
+             * Instead:
+             *   - mark alive=0
+             *   - stamp tombstone_us
+             *
+             * This enables:
+             *   - graceful recovery
+             *   - peer restart handling
+             *   - reconnect stabilization
+             *   - distributed self-healing
+             */
 
-            LOG_W("HB", "[%s] peer TIMEOUT: %s (last seen %.1fs ago)",
-                  agent->card.agent_id, p->agent_id,
+            p->alive = 0;
+
+            /*
+             * Start tombstone grace-period timer.
+             *
+             * Peer compaction/eviction will happen later
+             * only after the grace window expires.
+             */
+            p->tombstone_us = a2a_now_us();
+
+            LOG_W("HB",
+                  "[%s] peer TIMEOUT: %s "
+                  "(last seen %.1fs ago)",
+                  agent->card.agent_id,
+                  p->agent_id,
                   (double)age / 1e6);
 
             a2a_event_t ev = {0};
@@ -212,27 +237,29 @@ void heartbeat_on_received(a2a_agent_t *agent, const a2a_message_t *msg)
 
         if (!p->alive)
         {
-            /* Self-healing: peer came back */
+            /*
+             * Self-healing recovery path.
+             *
+             * Peer heartbeat resumed before tombstone
+             * eviction window expired.
+             */
+
             p->alive = 1;
-            p->last_send_attempt_us = 0; /* reset probe throttle */
-            LOG_I("HB", "[%s] peer RECOVERED: %s",
-                  agent->card.agent_id, p->agent_id);
 
             /*
-             * Post a PEER_DISCOVERED event so the FSM re-registers
-             * with the recovered peer and re-establishes protocol state.
+             * Clear tombstone because peer recovered.
              */
-            a2a_event_t ev = {0};
-            ev.type = A2A_EV_PEER_DISCOVERED;
-            ev.fsm_event = FSM_EVENT_PEER_DISCOVERED;
-            ev.timestamp_us = now;
-            snprintf(ev.data.peer.agent_id, sizeof(ev.data.peer.agent_id),
-                     "%s", p->agent_id);
-            snprintf(ev.data.peer.host, sizeof(ev.data.peer.host),
-                     "%s", p->host);
-            ev.data.peer.port = p->port;
-            ev.data.peer.agent_type = (int)p->type;
-            event_queue_push(&agent->eq, &ev);
+            p->tombstone_us = 0;
+
+            /*
+             * Reset reconnect probe throttling.
+             */
+            p->last_send_attempt_us = 0;
+
+            LOG_I("HB",
+                  "[%s] peer RECOVERED: %s",
+                  agent->card.agent_id,
+                  p->agent_id);
         }
         return;
     }

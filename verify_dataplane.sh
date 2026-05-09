@@ -29,7 +29,7 @@ echo ""
 # ── Flow tables ────────────────────────────────────────────────────
 echo "--- Flow Table Contents (after agents deploy) ---"
 for i in 1 3 5 7; do
-    N=$(docker exec sw$i ovs-ofctl dump-flows br0 2>/dev/null | grep -v "^NXST\|^OFPST" | wc -l)
+    N=$(docker exec sw$i ovs-ofctl -O OpenFlow13 dump-flows br0 2>/dev/null | grep -c "priority=")
     echo "  sw$i: $N flows in table"
     chk "sw$i has flows" "[ $N -gt 0 ]"
 done

@@ -265,7 +265,7 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
         LOG_D("NETLINK", "ARP: %s → %02x:%02x:%02x:%02x:%02x:%02x",
               ip_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-        /* FIX B4: Re-install flows for all active routes whose nexthop
+        /* Re-install flows for all active routes whose nexthop
          * just became ARP-resolved.  Routes previously installed as
          * output:NORMAL fallback will now get the correct L3 forwarding
          * actions (dec_ttl + MAC rewrite + port output). */
@@ -394,52 +394,184 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
             case RTM_NEWROUTE:
             {
                 parsed_route_t r;
+
                 if (parse_route_msg(nlh, &r) < 0)
                     break;
+
                 LOG_I("NETLINK", "RTM_NEWROUTE: %s via %s dev %s metric %d",
                       r.prefix, r.nexthop, r.ifname, r.metric);
 
-                const char *ifname = r.ifname[0] ? r.ifname : "kernel";
-                route_entry_t *ex = find_route_pub(ctx, r.prefix, ifname);
-                if (!ex)
-                {
+                /* Check for pending convergence timer */
+                for (int ci = 0; ci < L3_MAX_ROUTES; ci++) {
+
+                    if (!ctx->conv_log[ci].valid)
+                        continue;
+
+                    if (strcmp(ctx->conv_log[ci].prefix,
+                               r.prefix) != 0)
+                    {
+                        continue;
+                    }
+
+                    /* Compute convergence duration */
+                    uint64_t conv_us =
+                        a2a_now_us() -
+                        ctx->conv_log[ci].withdraw_us;
+
+                    ctx->conv_log[ci].valid = 0;
+
+                    /* Update convergence stats */
+                    ctx->conv_count++;
+                    ctx->conv_sum_us += conv_us;
+
+                    if (conv_us < ctx->conv_min_us)
+                        ctx->conv_min_us = conv_us;
+
+                    if (conv_us > ctx->conv_max_us)
+                        ctx->conv_max_us = conv_us;
+
+                    double avg_ms =
+                        (ctx->conv_count > 0)
+                        ? (double)ctx->conv_sum_us
+                          / ctx->conv_count / 1000.0
+                        : 0.0;
+
+                    LOG_I("NETLINK",
+                          "[%s] ROUTE CONVERGENCE: %s in %.1fms "
+                          "(min=%.1f avg=%.1f max=%.1f n=%u)",
+                          ctx->switch_id,
+                          r.prefix,
+                          (double)conv_us / 1000.0,
+                          ctx->conv_min_us == UINT64_MAX
+                              ? 0.0
+                              : (double)ctx->conv_min_us / 1000.0,
+                          avg_ms,
+                          (double)ctx->conv_max_us / 1000.0,
+                          ctx->conv_count);
+
+                    break;
+                }
+
+                const char *ifname =
+                    r.ifname[0] ? r.ifname : "kernel";
+
+                route_entry_t *ex =
+                    find_route_pub(ctx, r.prefix, ifname);
+
+                /* Add new route */
+                if (!ex) {
+
                     l3_add_route(ctx,
                                  r.prefix,
                                  r.nexthop,
                                  ctx->switch_id,
                                  ifname,
                                  r.metric,
-                                 1);
+                                 1 /* is_local */);
+
                 }
-                else if (r.metric < ex->metric)
-                {
+                /* Update better route */
+                else if (r.metric < ex->metric) {
+
                     withdraw_route_flow(ctx, ex);
 
-                    strncpy(ex->nexthop, r.nexthop, sizeof(ex->nexthop) - 1);
-                    ex->nexthop[sizeof(ex->nexthop) - 1] = '\0';
+                    strncpy(ex->nexthop,
+                            r.nexthop,
+                            sizeof(ex->nexthop) - 1);
 
-                    strncpy(ex->egress_ifname, ifname,
+                    ex->nexthop[
+                        sizeof(ex->nexthop) - 1] = '\0';
+
+                    strncpy(ex->egress_ifname,
+                            ifname,
                             sizeof(ex->egress_ifname) - 1);
-                    ex->egress_ifname[sizeof(ex->egress_ifname) - 1] = '\0';
+
+                    ex->egress_ifname[
+                        sizeof(ex->egress_ifname) - 1] = '\0';
 
                     ex->metric = r.metric;
 
                     install_route_flow(ctx, ex);
 
-                    LOG_I("NETLINK", "Route updated: %s new metric=%d",
-                          r.prefix, r.metric);
+                    LOG_I("NETLINK",
+                          "[%s] Route updated: %s new metric=%d",
+                          ctx->switch_id,
+                          r.prefix,
+                          r.metric);
                 }
+
                 break;
             }
 
             case RTM_DELROUTE:
             {
                 parsed_route_t r;
+
                 if (parse_route_msg(nlh, &r) < 0)
                     break;
-                LOG_I("NETLINK", "RTM_DELROUTE: %s via %s",
-                      r.prefix, r.nexthop);
+
+                LOG_I("NETLINK", "RTM_DELROUTE: %s via %s dev %s",
+                      r.prefix, r.nexthop, r.ifname);
+
+                /* Start convergence timer for withdrawn route */
+                uint64_t withdraw_time = a2a_now_us();
+
+                int recorded = 0;
+                int oldest_slot = 0;
+
+                uint64_t oldest_time = UINT64_MAX;
+
+                for (int ci = 0; ci < L3_MAX_ROUTES; ci++) {
+
+                    if (!ctx->conv_log[ci].valid) {
+
+                        /* Use free slot */
+                        strncpy(ctx->conv_log[ci].prefix,
+                                r.prefix,
+                                sizeof(ctx->conv_log[ci].prefix) - 1);
+
+                        ctx->conv_log[ci].withdraw_us = withdraw_time;
+                        ctx->conv_log[ci].valid       = 1;
+
+                        recorded = 1;
+
+                        LOG_D("NETLINK", "[%s] Convergence timer started "
+                              "for %s (slot=%d)",
+                              ctx->switch_id, r.prefix, ci);
+
+                        break;
+                    }
+
+                    /* Track oldest entry for replacement */
+                    if (ctx->conv_log[ci].withdraw_us < oldest_time) {
+                        oldest_time = ctx->conv_log[ci].withdraw_us;
+                        oldest_slot = ci;
+                    }
+                }
+
+                /* Replace oldest entry if table is full */
+                if (!recorded) {
+
+                    LOG_W("NETLINK", "[%s] conv_log full — overwriting "
+                          "slot %d (prefix=%s)",
+                          ctx->switch_id,
+                          oldest_slot,
+                          ctx->conv_log[oldest_slot].prefix);
+
+                    strncpy(ctx->conv_log[oldest_slot].prefix,
+                            r.prefix,
+                            sizeof(ctx->conv_log[oldest_slot].prefix) - 1);
+
+                    ctx->conv_log[oldest_slot].withdraw_us =
+                        withdraw_time;
+
+                    ctx->conv_log[oldest_slot].valid = 1;
+                }
+
                 l3_withdraw_route(ctx, r.prefix, "kernel_del");
+
+                ctx->route_withdrawals++;
+
                 break;
             }
 

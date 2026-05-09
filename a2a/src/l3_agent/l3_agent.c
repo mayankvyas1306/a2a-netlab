@@ -8,6 +8,14 @@
 #include "a2a_log.h"
 #include "a2a_transport.h"
 #include <sys/socket.h>
+#include <errno.h>
+#include <net/if.h>
+
+/* Forward declarations to avoid circular include with a2a_metrics.h */
+typedef struct a2a_metrics_t a2a_metrics_t;
+void metrics_record_latency(a2a_metrics_t *m, uint64_t sent_us);
+
+void ovsdb_process_update(const char *json, a2a_agent_t *agent);
 
 extern int ovsdb_get_ofport(const char *ifname);
 extern int ovs_of_connect(const char *bridge);
@@ -94,17 +102,37 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
     {
         out_port = ovsdb_get_ofport(r->egress_ifname);
 
-        // If the port isn't in OVS, delegate to the Linux Kernel routing stack
         if (out_port <= 0)
         {
-            LOG_I("L3", "[%s] Egress '%s' not in OVS. Installing NORMAL flow for %s",
-                  ctx->switch_id, r->egress_ifname, r->prefix);
-
+            /*
+             * Egress interface (e.g., c1c2, c1r1) is a kernel-only L3
+             * interface, not an OVS bridge port.  We MUST still install
+             * an OVS flow, because OVS intercepts every packet before
+             * the kernel sees it.  Without a flow, the table-miss
+             * CONTROLLER handler floods the packet on L2 ports only —
+             * it never reaches the kernel routing stack.
+             *
+             * output:NORMAL tells OVS to use its built-in L2 pipeline.
+             * For packets whose dst MAC equals the bridge's own MAC,
+             * OVS delivers them to the br0 internal port (ofport 65534),
+             * which hands them to the kernel.  The kernel's routing table
+             * then forwards via c1c2, c1r1, etc. as needed.
+             *
+             * This is identical to how Linux bridges work: packets
+             * addressed to the bridge are passed up to the IP stack.
+             */
             ovs_flow_t fl = {0};
-            fl.priority = 100;
-            snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
+            fl.priority    = 100;
+            fl.idle_timeout = 0;
+            fl.hard_timeout = 0;
+            snprintf(fl.match, sizeof(fl.match),
+                     "ip,nw_dst=%s", r->prefix);
             snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
             ovs_add_flow(ctx->bridge, &fl);
+            LOG_I("L3",
+                  "[%s] Fallback → NORMAL flow for %s"
+                  " (kernel routes via %s)",
+                  ctx->switch_id, r->prefix, r->egress_ifname);
             return;
         }
     }
@@ -133,13 +161,30 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
     }
     else
     {
-        /* 3. CRITICAL FIX: Fallback to NORMAL, not CONTROLLER.
-           This allows the kernel to answer ARPs for local gateway subnets */
-        snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
-        LOG_I("L3", "Fallback -> NORMAL flow for %s (Kernel routing will handle)", r->prefix);
+        // ARP not yet resolved for this nexthop.
+        // For direct-connected routes (nexthop == 0.0.0.0), use NORMAL
+        // so ARP requests from hosts can reach the gateway.
+        // For remote routes (nexthop is a real IP), skip installation —
+        // handle_neigh() will reinstall this flow once ARP resolves.
+        if (strcmp(r->nexthop, "0.0.0.0") == 0)
+        {
+            snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
+            LOG_I("L3", "[%s] Direct-connected route %s — installing NORMAL (ARP handled by kernel)",
+                  ctx->switch_id, r->prefix);
+            ovs_add_flow(ctx->bridge, &fl);
+        }
+        else
+        {
+            LOG_I("L3", "[%s] Deferring flow for %s (nexthop %s not ARP-resolved yet)",
+                  ctx->switch_id, r->prefix, r->nexthop);
+            // Flow will be installed by handle_neigh() when ARP resolves.
+            // Proactively trigger ARP resolution:
+            char arp_cmd[128];
+            snprintf(arp_cmd, sizeof(arp_cmd), "arping -c 1 -I %s %s >/dev/null 2>&1 &",
+                     r->egress_ifname, r->nexthop);
+            system(arp_cmd);
+        }
     }
-
-    ovs_add_flow(ctx->bridge, &fl);
 }
 /* Withdraw (delete) the flow for a route */
 void withdraw_route_flow(l3_agent_ctx_t *ctx,
@@ -212,6 +257,7 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
     r->is_local = is_local;
 
     install_route_flow(ctx, r);
+     ctx->route_installs++;  /* Track for metrics */
     notify_l2_peers_topology(ctx, r, 0);
 
     LOG_I("L3", "[%s] Route installed: %s via %s nh=%s metric=%d",
@@ -235,6 +281,7 @@ int l3_withdraw_route(l3_agent_ctx_t *ctx, const char *prefix,
         return -1;
     r->state = ROUTE_STATE_WITHDRAWN;
     withdraw_route_flow(ctx, r);
+     ctx->route_withdrawals++;  /* Track for metrics */
     notify_l2_peers_topology(ctx, r, 1);
     LOG_I("L3", "[%s] Route withdrawn: %s  reason=%s",
           ctx->switch_id, prefix, reason);
@@ -252,67 +299,256 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
         route_entry_t *r = &ctx->routes[i];
         if (r->state == ROUTE_STATE_WITHDRAWN)
             continue;
-        if (strcmp(r->via_switch, failed_switch) != 0)
+
+        /*
+         * Match routes affected by this failure.
+         *
+         * L2 agents report their own switch_id (e.g., "sw1").
+         * L3 routes store via_switch as the local router id (e.g., "core1").
+         * Direct name comparison never matches.
+         *
+         * Instead: a route is affected if its egress interface is the
+         * access-side port connected to the reporting switch.
+         *
+         * The access port naming convention is:
+         *   core1's access port to sw1 = c1s1 (configured in network_setup.sh)
+         *   core2's access port to sw3 = c2s3, etc.
+         *
+         * We detect this by checking whether the egress interface name
+         * contains the failed switch's numeric ID.
+         * E.g., failed_switch="sw1" → digit='1' → matches c1s1, s1c1, etc.
+         *
+         * For port-based matching: failed_port matches the OVS ofport
+         * of the access interface (port 1 = c1s1 on core1).
+         *
+         * Use EITHER criterion: egress ifname contains switch digit,
+         * OR egress_ifname is empty (local direct routes via br0).
+         */
+        int affected = 0;
+
+        /* Extract digit from switch name ("sw1" → '1', "sw3" → '3') */
+        const char *sw_digit_ptr = failed_switch;
+        while (*sw_digit_ptr && !(*sw_digit_ptr >= '0' && *sw_digit_ptr <= '9'))
+            sw_digit_ptr++;
+        char sw_digit = *sw_digit_ptr; /* '1', '2', ... '8' or '\0' */
+
+        if (r->egress_ifname[0] && sw_digit != '\0')
+        {
+            /* Check if egress interface name contains the switch digit
+             * at a position that indicates it is an access port.
+             */
+            const char *ef = r->egress_ifname;
+            for (int ci = 0; ef[ci]; ci++)
+            {
+                if (ef[ci] == sw_digit &&
+                    ci > 0 &&
+                    ef[ci-1] == 's')
+                {
+                    affected = 1;
+                    break;
+                }
+            }
+        }
+        else if (r->egress_ifname[0] == '\0' ||
+                 strcmp(r->egress_ifname, "kernel") == 0)
+        {
+            /* Local/direct routes with no specific egress port —
+             * not affected by access-layer link failures. */
+            affected = 0;
+        }
+
+        if (!affected)
             continue;
 
-        /* This route is affected */
-        route_entry_t *alt = find_alternate(ctx, r->prefix,
-                                            failed_switch);
+        // This route goes through the failed switch/port.
+        // Find an alternate path.
+        route_entry_t *alt = find_alternate(ctx, r->prefix, r->via_switch);
+
         if (alt)
         {
-            LOG_I("L3", "[%s] Prefix %s: rerouting via %s → %s "
-                        "(metric %d→%d)",
-                  ctx->switch_id, r->prefix,
-                  r->via_switch, alt->via_switch,
-                  r->metric, alt->metric);
+            // Withdraw the broken flow and install the alternate
             withdraw_route_flow(ctx, r);
-            r->state = ROUTE_STATE_DEGRADED;
-            /*
-             * Update via_switch so heartbeat verification does not
-             * see the failed switch and immediately trigger another
-             * reroute on the next tick — creating a reroute storm.
-             */
-            snprintf(r->via_switch, sizeof(r->via_switch),
-                     "%s", alt->via_switch);
-            snprintf(r->nexthop, sizeof(r->nexthop),
-                     "%s", alt->nexthop);
-            r->metric = alt->metric;
-            r->state = ROUTE_STATE_ACTIVE;
-            install_route_flow(ctx, r);
-            notify_l2_peers_topology(ctx, r, 0);
+            r->state = ROUTE_STATE_WITHDRAWN;
+            ctx->route_withdrawals++;
+
+            // Install the alternate route flow
+            install_route_flow(ctx, alt);
             ctx->reroutes_performed++;
+
+            LOG_I("L3", "[%s] Reroute complete: %s via alternate %s",
+                  ctx->switch_id, r->prefix, alt->egress_ifname);
+
+            notify_l2_peers_topology(ctx, r, 1);   // withdraw old
+            notify_l2_peers_topology(ctx, alt, 0); // install new
         }
         else
         {
-            LOG_W("L3", "[%s] Prefix %s: NO ALTERNATE — marking degraded",
+            LOG_W("L3", "[%s] No alternate found for %s — marking degraded",
                   ctx->switch_id, r->prefix);
-            r->state = ROUTE_STATE_DEGRADED;
-            /* Alert all L3 peers */
-            l3_event_payload_t pl = {0};
-            strncpy(pl.prefix, r->prefix, sizeof(pl.prefix) - 1);
-            strncpy(pl.via_switch, failed_switch, A2A_MAX_AGENT_ID - 1);
-            pl.is_withdraw = 1;
-            strncpy(pl.reason, "no_alternate", sizeof(pl.reason) - 1);
 
-            a2a_message_t msg = {0};
-            msg.msg_id = ++ctx->agent->msg_counter;
-            msg.msg_type = MSG_L3_EVENT;
-            msg.timestamp_us = a2a_now_us();
-            strncpy(msg.src_agent, ctx->agent->card.agent_id,
-                    A2A_MAX_AGENT_ID - 1);
-            a2a_msg_set_l3_event(&msg, &pl);
-
-            for (int j = 0; j < ctx->agent->peer_count; j++)
+            /*
+             * Even without an OVS-level alternate route, we must fix the
+             * kernel routing table so return traffic can reach the subnet
+             * via the secondary access port (c1s2 when c1s1 is down).
+             *
+             * The secondary port naming convention:
+             *   Primary:   cNsM   (e.g., c1s1 for core1→sw1)
+             *   Secondary: cNsM'  (e.g., c1s2 for core1→sw2)
+             *
+             * When sw1 (digit=1) fails and egress=c1s1, the secondary
+             * access is c1s2. We add a kernel host route via the secondary
+             * port so return traffic reaches sw2→sw1→hosts.
+             *
+             * This is a kernel-level fix; the OVS flow on core1 can still
+             * use output:normal since c1s2 is a kernel interface not in OVS.
+             */
+            if (r->egress_ifname[0] && sw_digit != '\0')
             {
-                agent_peer_t *p = &ctx->agent->peers[j];
-                if (p->type != AGENT_TYPE_L3 || !p->alive)
-                    continue;
-                strncpy(msg.dst_agent, p->agent_id,
-                        A2A_MAX_AGENT_ID - 1);
-                if (conn_pool_send(&ctx->agent->pool, p->host, p->port, &msg) != 0)
+                /* Build secondary port name: replace digit at position */
+                char sec_if[IF_NAMESIZE] = {0};
+                strncpy(sec_if, r->egress_ifname, sizeof(sec_if)-1);
+
+                /*
+                 * Find the switch digit in the egress ifname and
+                 * determine secondary switch.
+                 * sw1↔sw2, sw3↔sw4, sw5↔sw6, sw7↔sw8.
+                 * Secondary digit: odd→even, even→odd.
+                 */
+                char sec_digit = '\0';
+                int sw_num = sw_digit - '0';
+                if (sw_num >= 1 && sw_num <= 8)
                 {
-                    ctx->agent->send_failures++;
-                    LOG_W("L3", "Send failed to peer %s", p->agent_id);
+                    /* pair: (1,2), (3,4), (5,6), (7,8) */
+                    int sec_num = (sw_num % 2 == 1) ? sw_num + 1 : sw_num - 1;
+                    sec_digit = '0' + sec_num;
+                }
+
+                if (sec_digit != '\0')
+                {
+                    /* Replace the switch digit in the interface name */
+                    for (int ci = 0; sec_if[ci]; ci++)
+                    {
+                        if (sec_if[ci] == sw_digit &&
+                            ci > 0 && sec_if[ci-1] == 's')
+                        {
+                            sec_if[ci] = sec_digit;
+                            break;
+                        }
+                    }
+
+                    /* Verify secondary interface exists and is up */
+                    char chk[128];
+                    snprintf(chk, sizeof(chk),
+                             "ip link show %s 2>/dev/null | grep -q 'state UP'",
+                             sec_if);
+                    if (system(chk) == 0)
+                    {
+                        /*
+                         * Add kernel route for the subnet via secondary if.
+                         * Use 'ip route replace' to be idempotent.
+                         * metric=50 to prefer the primary when it comes back.
+                         */
+                        char cmd[256];
+                        snprintf(cmd, sizeof(cmd),
+                                 "ip route replace %s dev %s metric 50 2>/dev/null",
+                                 r->prefix, sec_if);
+                        (void)system(cmd);
+
+                        LOG_I("L3", "[%s] Kernel route repair: %s via dev %s (secondary access)",
+                              ctx->switch_id, r->prefix, sec_if);
+
+                        r->state = ROUTE_STATE_DEGRADED;
+                    }
+                    else
+                    {
+                        LOG_W("L3", "[%s] Secondary if %s not UP — cannot repair kernel route",
+                              ctx->switch_id, sec_if);
+                    }
+                }
+            }
+
+        }
+    }
+
+    /*
+     * Direct kernel route repair for the access subnet.
+     *
+     * The route-matching loop above fails for directly-connected subnets
+     * because the kernel reports egress_ifname="br0" (the OVS bridge),
+     * not the physical port name "c1s1". The digit-matching logic
+     * never matches "br0", so the kernel route repair is skipped.
+     *
+     * Fix: directly compute the subnet and secondary interface from
+     * the topology naming convention and install the route.
+     *
+     * Topology mapping:
+     *   sw1 down -> core1 needs 10.0.0.0/24 via c1s2
+     *   sw3 down -> core2 needs 20.0.0.0/24 via c2s4
+     *   sw5 down -> core3 needs 30.0.0.0/24 via c3s6
+     *   sw7 down -> core4 needs 40.0.0.0/24 via c4s8
+     *
+     * Only odd-numbered switches need repair (they connect to the
+     * primary port on the core's br0). Even-numbered switches connect
+     * to the secondary port which is a raw kernel interface -- when
+     * they fail, the primary route via br0 still works.
+     *
+     * We use "ip route replace" (no metric) to REPLACE the unusable
+     * br0 route. metric=50 doesn't work because the kernel always
+     * prefers the metric=0 br0 route even when br0's only port is down
+     * (br0 itself stays UP as a virtual device).
+     */
+    {
+        const char *sw_dp = failed_switch;
+        while (*sw_dp && !(*sw_dp >= '0' && *sw_dp <= '9'))
+            sw_dp++;
+        if (*sw_dp)
+        {
+            int sw_n = *sw_dp - '0';
+            /* Only odd switches need repair */
+            if (sw_n >= 1 && sw_n <= 8 && (sw_n % 2 == 1))
+            {
+                int sec_n = sw_n + 1;
+
+                /* Extract core digit from our own switch_id */
+                const char *cp = ctx->switch_id;
+                while (*cp && !(*cp >= '1' && *cp <= '9'))
+                    cp++;
+
+                if (*cp)
+                {
+                    char sec_if[32];
+                    snprintf(sec_if, sizeof(sec_if), "c%cs%d", *cp, sec_n);
+
+                    const char *subnet = NULL;
+                    if (sw_n == 1) subnet = "10.0.0.0/24";
+                    else if (sw_n == 3) subnet = "20.0.0.0/24";
+                    else if (sw_n == 5) subnet = "30.0.0.0/24";
+                    else if (sw_n == 7) subnet = "40.0.0.0/24";
+
+                    if (subnet)
+                    {
+                        char chk[128];
+                        snprintf(chk, sizeof(chk),
+                                 "ip link show %s 2>/dev/null | grep -q 'state UP'",
+                                 sec_if);
+                        if (system(chk) == 0)
+                        {
+                            char cmd[256];
+                            snprintf(cmd, sizeof(cmd),
+                                     "ip route replace %s dev %s 2>/dev/null",
+                                     subnet, sec_if);
+                            (void)system(cmd);
+
+                            LOG_I("L3", "[%s] Kernel route repair: %s via dev %s "
+                                  "(direct access failover)",
+                                  ctx->switch_id, subnet, sec_if);
+                        }
+                        else
+                        {
+                            LOG_W("L3", "[%s] Secondary if %s not UP",
+                                  ctx->switch_id, sec_if);
+                        }
+                    }
                 }
             }
         }
@@ -409,7 +645,31 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
 {
     uint64_t now = a2a_now_us();
 
-    /*  Per-source 500ms rate limit */
+    /* Parse payload first so we can exempt STORM_CLEAR from rate limiting.
+     * STORM_CLEAR must always reach the handler — it restores port state.
+     * If suppressed, the rate-limit flow installed during the storm is never
+     * removed and the port stays throttled indefinitely. */
+    l2_anomaly_payload_t pl = {0};
+    if (a2a_msg_get_l2_anomaly(msg, &pl) < 0)
+        return;
+
+    ctx->l2_events_received++;
+
+    LOG_I("L3", "[%s] anomaly from %s type=%d port=%d pps=%u",
+          ctx->switch_id, msg->src_agent,
+          pl.anomaly_type, pl.port, pl.pps);
+
+    /* STORM_CLEAR bypasses the rate limiter unconditionally.
+     * All other anomaly types go through the 2s per-source rate limit. */
+    if (pl.anomaly_type == L2_ANOMALY_STORM_CLEAR) {
+        LOG_I("L3", "Decision: STORM_CLEAR → restore");
+        l3_send_policy(ctx, msg->src_agent,
+                       POLICY_RESTORE_PORT,
+                       pl.port, NULL, 0);
+        return;
+    }
+
+    /* Per-source 2s rate limit for all other anomaly types */
     int slot = -1;
 
     for (int i = 0; i < L2_ANOMALY_SOURCES_MAX; i++)
@@ -441,15 +701,6 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
 
     g_anomaly_rate[slot].last_action_us = now;
 
-    l2_anomaly_payload_t pl = {0};
-    if (a2a_msg_get_l2_anomaly(msg, &pl) < 0)
-        return;
-
-    ctx->l2_events_received++;
-
-    LOG_I("L3", "[%s] anomaly from %s type=%d port=%d pps=%u",
-          ctx->switch_id, msg->src_agent,
-          pl.anomaly_type, pl.port, pl.pps);
 
     switch (pl.anomaly_type)
     {
@@ -491,12 +742,81 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         l3_reroute_around(ctx, pl.switch_id, pl.port);
         break;
 
-    case L2_ANOMALY_STORM_CLEAR:
-        LOG_I("L3", "Decision: STORM_CLEAR → restore");
-        l3_send_policy(ctx, msg->src_agent,
-                       POLICY_RESTORE_PORT,
-                       pl.port, NULL, 0);
+    case L2_ANOMALY_LINK_UP:
+    {
+        LOG_I("L3", "Decision: LINK_UP → restore routes for switch %s",
+              pl.switch_id);
+
+        /*
+         * Restore the primary kernel route via br0 when the access
+         * link comes back up. This reverses the "ip route replace"
+         * done in l3_reroute_around.
+         *
+         * Also remove any metric=50 secondary routes that may have
+         * been installed by the old code path.
+         */
+        const char *sw_dp = pl.switch_id;
+        while (*sw_dp && !(*sw_dp >= '0' && *sw_dp <= '9'))
+            sw_dp++;
+
+        if (*sw_dp)
+        {
+            int sw_n = *sw_dp - '0';
+            if (sw_n >= 1 && sw_n <= 8 && (sw_n % 2 == 1))
+            {
+                int sec_n = sw_n + 1;
+
+                const char *cp = ctx->switch_id;
+                while (*cp && !(*cp >= '1' && *cp <= '9'))
+                    cp++;
+
+                if (*cp)
+                {
+                    char sec_if[32];
+                    snprintf(sec_if, sizeof(sec_if), "c%cs%d", *cp, sec_n);
+
+                    const char *subnet = NULL;
+                    const char *gw_ip = NULL;
+                    if (sw_n == 1) { subnet = "10.0.0.0/24"; gw_ip = "10.0.0.254"; }
+                    else if (sw_n == 3) { subnet = "20.0.0.0/24"; gw_ip = "20.0.0.254"; }
+                    else if (sw_n == 5) { subnet = "30.0.0.0/24"; gw_ip = "30.0.0.254"; }
+                    else if (sw_n == 7) { subnet = "40.0.0.0/24"; gw_ip = "40.0.0.254"; }
+
+                    if (subnet && gw_ip)
+                    {
+                        /* Restore primary route via br0 */
+                        char cmd[256];
+                        snprintf(cmd, sizeof(cmd),
+                                 "ip route replace %s dev br0 src %s 2>/dev/null",
+                                 subnet, gw_ip);
+                        (void)system(cmd);
+
+                        /* Also remove any stale metric=50 route */
+                        snprintf(cmd, sizeof(cmd),
+                                 "ip route del %s dev %s metric 50 2>/dev/null",
+                                 subnet, sec_if);
+                        (void)system(cmd);
+
+                        LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0, "
+                              "removed secondary via %s",
+                              ctx->switch_id, subnet, sec_if);
+                    }
+                }
+            }
+        }
+
+        /* Also restore any DEGRADED routes tracked by the route table */
+        for (int ri = 0; ri < ctx->route_count; ri++)
+        {
+            route_entry_t *r = &ctx->routes[ri];
+            if (r->state == ROUTE_STATE_DEGRADED)
+            {
+                r->state = ROUTE_STATE_ACTIVE;
+                r->last_verified_us = a2a_now_us();
+            }
+        }
         break;
+    }
 
     default:
         break;
@@ -785,7 +1105,10 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
               ctx->switch_id, msg->msg_type, msg->src_agent);
         break;
     }
-
+    {
+        extern a2a_metrics_t g_metrics;
+        metrics_record_latency(&g_metrics, ev->data.msg.timestamp_us);
+    }
     a2a_event_t done = {0};
     done.type = A2A_EV_MSG_RECEIVED;
     done.fsm_event = FSM_EVENT_PROCESSING_DONE;
@@ -962,50 +1285,111 @@ static void l3_netlink_epoll_handler(int fd, void *ud)
     l3_netlink_process(ctx);
 }
 
+/*
+ * Handle incoming OVSDB messages for L3 agent.
+ * Reassembles partial JSON messages and processes complete updates.
+ */
+/*
+ * Handle OVSDB messages for L3 agent.
+ * Supports partial JSON reassembly.
+ */
 static void l3_ovsdb_epoll_handler(int fd, void *ud)
 {
     l3_agent_ctx_t *ctx = (l3_agent_ctx_t *)ud;
 
-    char buf[65536];
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-    if (n <= 0)
+    /* Reset if buffer is nearly full */
+    if (ctx->ovsdb_len >= sizeof(ctx->ovsdb_buf) - 1024) {
+        LOG_E("L3-OVSDB", "[%s] OVSDB buffer overflow (%zu bytes) — resetting",
+              ctx->switch_id, ctx->ovsdb_len);
+        ctx->ovsdb_len = 0;
+        memset(ctx->ovsdb_buf, 0, sizeof(ctx->ovsdb_buf));
+    }
+
+    /* Append new data into buffer */
+    ssize_t n = recv(fd,
+                     ctx->ovsdb_buf + ctx->ovsdb_len,
+                     sizeof(ctx->ovsdb_buf) - ctx->ovsdb_len - 1,
+                     MSG_DONTWAIT);
+
+    if (n <= 0) {
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOG_E("L3-OVSDB", "[%s] OVSDB recv error errno=%d",
+                  ctx->switch_id, errno);
+        }
         return;
+    }
 
-    buf[n] = '\0';
+    ctx->ovsdb_len += (size_t)n;
+    ctx->ovsdb_buf[ctx->ovsdb_len] = '\0';
 
-    char *p = buf;
+    LOG_D("L3-OVSDB", "[%s] OVSDB recv %zd bytes (total=%zu)",
+          ctx->switch_id, n, ctx->ovsdb_len);
+
+    /* Process newline-terminated JSON messages */
+    char *p   = ctx->ovsdb_buf;
     char *nl;
 
-    while ((nl = strchr(p, '\n')) != NULL)
-    {
-        *nl = '\0';
-        if (nl > p)
+    while ((nl = strchr(p, '\n')) != NULL) {
+        *nl = '\0';   /* terminate JSON string */
+
+        if (nl > p) { /* skip empty lines */
+            LOG_D("L3-OVSDB", "[%s] Processing OVSDB message (%zu bytes)",
+                  ctx->switch_id, (size_t)(nl - p));
             ovsdb_process_update(p, ctx->agent);
-        p = nl + 1;
+        }
+
+        p = nl + 1;   /* move to next message */
     }
-    /* Fallback: process complete JSON object without trailing newline */
-    size_t remaining = (size_t)(buf + n - p);
-    if (remaining > 0 && p[0] == '{')
-    {
-        int depth = 0, complete = 0;
-        for (size_t i = 0; i < remaining; i++)
-        {
-            if (p[i] == '{')
-                depth++;
-            else if (p[i] == '}')
-            {
-                if (--depth == 0)
-                {
-                    complete = 1;
-                    break;
+
+    /* Handle complete JSON without newline */
+    size_t remaining = (size_t)(ctx->ovsdb_buf + ctx->ovsdb_len - p);
+
+    if (remaining > 0 && p[0] == '{') {
+        int   depth    = 0;
+        int   complete = 0;
+        int   in_str   = 0;  /* inside string */
+        char  prev     = 0;
+
+        for (size_t i = 0; i < remaining; i++) {
+            char c = p[i];
+
+            /* Ignore braces inside strings */
+            if (c == '"' && prev != '\\') {
+                in_str = !in_str;
+            } else if (!in_str) {
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    if (--depth == 0) {
+                        complete = 1;
+                        break;
+                    }
                 }
             }
+            prev = (c == '\\' && prev == '\\') ? 0 : c;
         }
-        if (complete)
+
+        if (complete) {
+            LOG_D("L3-OVSDB", "[%s] Processing complete JSON object "
+                  "(brace-counted, %zu bytes)",
+                  ctx->switch_id, remaining);
             ovsdb_process_update(p, ctx->agent);
+            remaining = 0;  /* fully consumed */
+        }
+        /* keep partial JSON for next recv() */
+    }
+
+    /* Move remaining bytes to buffer start */
+    if (remaining > 0 && p != ctx->ovsdb_buf) {
+        memmove(ctx->ovsdb_buf, p, remaining);
+    }
+    ctx->ovsdb_len = remaining;
+
+    /* Clear consumed buffer region */
+    if (remaining < sizeof(ctx->ovsdb_buf)) {
+        memset(ctx->ovsdb_buf + remaining, 0,
+               sizeof(ctx->ovsdb_buf) - remaining);
     }
 }
-
 l3_agent_ctx_t *l3_agent_create(const char *agent_id,
                                 const char *switch_id,
                                 const char *bridge,
@@ -1031,6 +1415,14 @@ l3_agent_ctx_t *l3_agent_create(const char *agent_id,
     }
 
     ctx->agent->userdata = ctx;
+
+    /* Initialize OVSDB buffer and convergence stats */
+    ctx->ovsdb_len   = 0;
+    ctx->conv_min_us = UINT64_MAX;
+    ctx->conv_count  = 0;
+    ctx->conv_sum_us = 0;
+    ctx->conv_max_us = 0;
+    /* conv_log[] already zeroed by calloc() */
 
     int ovsdb_fd = ovsdb_connect();
     if (ovsdb_fd >= 0)
@@ -1080,6 +1472,14 @@ l3_agent_ctx_t *l3_agent_create(const char *agent_id,
                                   ctx);
             /* Dump initial route table */
             l3_netlink_dump_routes(ctx);
+            // Proactively ARP all transit nexthops so OVS flows get installed
+            // immediately rather than waiting for the first packet.
+            LOG_I("L3", "[%s] Probing ARP for all kernel nexthops...", ctx->switch_id);
+            system("ip neigh flush all 2>/dev/null; "
+                   "for nh in $(ip route | awk '/via/ {print $3}' | sort -u); do "
+                   "    dev=$(ip route get $nh | awk '/dev/ {for(i=1;i<NF;i++) if($i==\"dev\") print $(i+1)}'); "
+                   "    arping -c 2 -I $dev $nh >/dev/null 2>&1 & "
+                   "done");
             LOG_I("L3", "[%s] Netlink monitor active fd=%d",
                   switch_id, nl_fd);
         }
@@ -1119,25 +1519,193 @@ void l3_agent_destroy(l3_agent_ctx_t *ctx)
 
 void l3_agent_tick(l3_agent_ctx_t *ctx)
 {
-    /* L3 tick is driven by FSM events; no additional periodic work here
-       beyond what on_heartbeat_tick handles. */
-    (void)ctx;
+    /*
+     * Periodic L3 maintenance and health monitoring.
+     * Runs from the main loop every few milliseconds.
+     */
+
+    static uint64_t last_health_log_us = 0;
+
+    uint64_t now = a2a_now_us();
+
+    /* Log route health every 60 seconds */
+    if (now - last_health_log_us < 60ULL * 1000000ULL)
+        return;
+
+    last_health_log_us = now;
+
+    /* Count routes by state */
+    int active = 0;
+    int degraded = 0;
+    int withdrawn = 0;
+    int local = 0;
+
+    for (int i = 0; i < ctx->route_count; i++) {
+
+        switch (ctx->routes[i].state) {
+
+        case ROUTE_STATE_ACTIVE:
+            active++;
+
+            if (ctx->routes[i].is_local)
+                local++;
+
+            break;
+
+        case ROUTE_STATE_DEGRADED:
+            degraded++;
+            break;
+
+        case ROUTE_STATE_WITHDRAWN:
+            withdrawn++;
+            break;
+        }
+    }
+
+    /* Route health summary */
+    LOG_I("L3", "[%s] Route health: active=%d (local=%d) "
+          "degraded=%d withdrawn=%d | reroutes=%u "
+          "l2_events=%u installs=%u withdrawals=%u",
+          ctx->switch_id,
+          active,
+          local,
+          degraded,
+          withdrawn,
+          ctx->reroutes_performed,
+          ctx->l2_events_received,
+          ctx->route_installs,
+          ctx->route_withdrawals);
+
+    /* Print convergence statistics */
+    if (ctx->conv_count > 0) {
+
+        LOG_I("L3", "[%s] Convergence: n=%u "
+              "min=%.1fms avg=%.1fms max=%.1fms",
+              ctx->switch_id,
+              ctx->conv_count,
+              ctx->conv_min_us == UINT64_MAX
+                  ? 0.0
+                  : (double)ctx->conv_min_us / 1000.0,
+              (double)ctx->conv_sum_us
+                  / ctx->conv_count / 1000.0,
+              (double)ctx->conv_max_us / 1000.0);
+    }
+
+    /* Warn about long degraded routes */
+    for (int i = 0; i < ctx->route_count; i++) {
+
+        route_entry_t *r = &ctx->routes[i];
+
+        if (r->state != ROUTE_STATE_DEGRADED)
+            continue;
+
+        uint64_t degraded_for_us =
+            now - r->last_verified_us;
+
+        if (degraded_for_us > 60ULL * 1000000ULL) {
+
+            LOG_W("L3", "[%s] Route STUCK DEGRADED "
+                  "for %.0fs: %s via %s",
+                  ctx->switch_id,
+                  (double)degraded_for_us / 1e6,
+                  r->prefix,
+                  r->via_switch);
+        }
+    }
 }
 
 void l3_print_routes(l3_agent_ctx_t *ctx)
 {
-    static const char *snames[] = {"ACTIVE", "DEGRADED", "WITHDRAWN"};
-    printf("\n[L3:%s] Route Table (%d routes):\n",
-           ctx->switch_id, ctx->route_count);
-    printf("  %-20s %-16s %-20s %-6s %s\n",
-           "PREFIX", "NEXTHOP", "VIA-SWITCH", "METRIC", "STATE");
-    printf("  %-20s %-16s %-20s %-6s %s\n",
-           "------", "-------", "----------", "------", "-----");
+    static const char *snames[] = {
+        "ACTIVE",
+        "DEGRADED",
+        "WITHDRAWN"
+    };
+
+    /*
+     * Use structured logging instead of printf().
+     *
+     * In detached Docker/container environments,
+     * stdout is often not visible in runtime logs.
+     *
+     * LOG_I() ensures:
+     *   - docker logs visibility
+     *   - centralized logging
+     *   - timestamped output
+     *   - production-grade observability
+     */
+
+    LOG_I("L3",
+          "[%s] Route Table (%d routes):",
+          ctx->switch_id,
+          ctx->route_count);
+
+    LOG_I("L3",
+          "  %-20s %-16s %-20s %-6s %s",
+          "PREFIX",
+          "NEXTHOP",
+          "VIA-SWITCH",
+          "METRIC",
+          "STATE");
+
+    LOG_I("L3",
+          "  %-20s %-16s %-20s %-6s %s",
+          "------",
+          "-------",
+          "----------",
+          "------",
+          "-----");
+
     for (int i = 0; i < ctx->route_count; i++)
     {
         route_entry_t *r = &ctx->routes[i];
-        printf("  %-20s %-16s %-20s %-6d %s%s\n",
-               r->prefix, r->nexthop, r->via_switch, r->metric,
-               snames[r->state], r->is_local ? " [local]" : "");
+
+        LOG_I("L3",
+              "  %-20s %-16s %-20s %-6d %s%s",
+              r->prefix,
+              r->nexthop,
+              r->via_switch,
+              r->metric,
+              snames[r->state],
+              r->is_local ? " [local]" : "");
+    }
+
+    /*
+     * Route convergence metrics.
+     *
+     * These metrics measure:
+     *   - failover convergence
+     *   - reroute convergence
+     *   - distributed recovery timing
+     */
+
+    if (ctx->conv_count > 0)
+    {
+        LOG_I("L3",
+              "  Route Convergence Statistics:");
+
+        LOG_I("L3",
+              "    Samples : %u",
+              ctx->conv_count);
+
+        LOG_I("L3",
+              "    Min     : %.1f ms",
+              ctx->conv_min_us == UINT64_MAX
+                  ? 0.0
+                  : (double)ctx->conv_min_us / 1000.0);
+
+        LOG_I("L3",
+              "    Average : %.1f ms",
+              (double)ctx->conv_sum_us
+                  / ctx->conv_count / 1000.0);
+
+        LOG_I("L3",
+              "    Max     : %.1f ms",
+              (double)ctx->conv_max_us / 1000.0);
+    }
+    else
+    {
+        LOG_I("L3",
+              "  Route Convergence: no events recorded yet");
     }
 }

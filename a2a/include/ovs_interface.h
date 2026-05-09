@@ -64,5 +64,5 @@ int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
 struct a2a_server;
 void ovs_of_register_epoll  (struct a2a_server *server);
 void ovs_of_deregister_epoll(struct a2a_server *server);
-
+int ovs_of_del_flow_at_priority(const char *bridge, const char *match, uint16_t priority);
 #endif /* OVS_INTERFACE_H */

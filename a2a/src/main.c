@@ -9,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
-
+#include <time.h>
 #include "a2a_message.h"
 #include "a2a_agent.h"
 #include "a2a_fsm.h"
@@ -19,6 +19,8 @@
 #include "l2_agent.h"
 #include "l3_agent.h"
 #include "a2a_log.h"
+#include "a2a_metrics.h"
+
 
 #define HEARTBEAT_INTERVAL_US (3ULL * 1000000ULL)
 #define POOL_GC_INTERVAL_US (30ULL * 1000000ULL)
@@ -26,6 +28,8 @@
 
 static volatile int g_running = 1;
 static volatile int g_dump_state = 0;
+
+a2a_metrics_t g_metrics;
 
 static void handle_sigint(int sig)
 {
@@ -223,6 +227,9 @@ int main(int argc, char *argv[])
     uint64_t next_gc_us = a2a_now_us() + POOL_GC_INTERVAL_US;
     uint64_t next_discovery_us = a2a_now_us() + DISCOVERY_INTERVAL_US;
 
+
+    metrics_init(&g_metrics);
+
     LOG_I("MAIN", "%s agent running. Ctrl-C to stop.", type);
 
     while (g_running)
@@ -319,20 +326,43 @@ int main(int argc, char *argv[])
         if (g_dump_state)
         {
             g_dump_state = 0;
+
+            /*
+             * Update throughput/CPU metrics before dumping.
+             * metrics_record_latency() is called per-message so
+             * latency data is always current.
+             */
+            metrics_update(&g_metrics, agent);
+
+            /*
+             * JSON metrics line — parseable by monitoring tools.
+             * Format: {"metrics":{...}}\n
+             * Each SIGUSR1 produces exactly one line.
+             */
+            metrics_dump(&g_metrics, agent, l2, l3);
+
+            /* Human-readable state for log inspection */
             LOG_I("DEBUG", "=== STATE DUMP ===");
-            LOG_I("DEBUG", "fsm_state=%s peers=%d",
-                  fsm_state_str(agent->fsm_state), agent->peer_count);
-            LOG_I("DEBUG", "msgs sent=%lu recv=%lu drop=%lu",
+            LOG_I("DEBUG", "fsm_state=%s peers=%d uptime=%.0fs",
+                  fsm_state_str(agent->fsm_state),
+                  agent->peer_count,
+                  (double)(a2a_now_us() - agent->start_time_us) / 1e6);
+            LOG_I("DEBUG", "msgs sent=%lu recv=%lu dropped=%lu",
                   agent->msgs_sent, agent->msgs_received,
                   agent->events_dropped);
-            LOG_I("DEBUG", "send_failures=%lu fsm_invalid=%lu",
-                  agent->send_failures, agent->fsm_invalid_transitions);
-            LOG_I("DEBUG", "event_queue_size=%d",
-                  event_queue_size(&agent->eq));
-            if (l2)
-                l2_print_table(l2);
-            if (l3)
-                l3_print_routes(l3);
+            LOG_I("DEBUG", "send_failures=%lu fsm_invalid=%lu "
+                  "latency_avg=%.1fus",
+                  agent->send_failures,
+                  agent->fsm_invalid_transitions,
+                  g_metrics.latency_count > 0
+                      ? (double)g_metrics.latency_sum_us
+                        / g_metrics.latency_count
+                      : 0.0);
+            LOG_I("DEBUG", "event_queue_size=%d/%d",
+                  event_queue_size(&agent->eq), EVENT_QUEUE_SIZE);
+
+            if (l2) l2_print_table(l2);
+            if (l3) l3_print_routes(l3);
         }
     }
 

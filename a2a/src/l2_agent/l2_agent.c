@@ -12,6 +12,10 @@
 #include "ovs_interface.h"
 #include <sys/socket.h>
 
+/* Forward declarations to avoid circular include with a2a_metrics.h */
+typedef struct a2a_metrics_t a2a_metrics_t;
+void metrics_record_latency(a2a_metrics_t *m, uint64_t sent_us);
+
 void ovsdb_process_update(const char *json, a2a_agent_t *agent);
 
 extern int ovs_of_connect(const char *bridge);
@@ -31,6 +35,9 @@ static void l2_report_anomaly(l2_agent_ctx_t *ctx,
                               uint32_t pps,
                               const char *mac,
                               const char *reason);
+static const char *l2_get_neighbor_ip(const char *switch_id);
+static const char *l2_get_gateway_ip(const char *switch_id);
+static const char *l2_get_interswitch_port(const char *switch_id);
 
 static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 {
@@ -228,12 +235,14 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                         LOG_W("L2", "[%s] Refusing to isolate uplink port %d (%s) — "
                                     "applying rate-limit instead",
                               ctx->switch_id, pl.port, ifname);
-                        /* Downgrade to rate-limit to contain the anomaly */
-                        ovs_of_add_meter(ctx->bridge, 1, 10000); /* 10 Mbps cap */
+                        /* Downgrade to rate-limit to contain the anomaly.
+                         * Use meter 2 to avoid overwriting the broadcast
+                         * protection meter (meter 1, 1500 kbps). */
+                        ovs_of_add_meter(ctx->bridge, 2, 10000); /* 10 Mbps cap */
                         ovs_flow_t fl = {0};
-                        fl.priority = 200;
+                        fl.priority = 1;
                         snprintf(fl.match, sizeof(fl.match), "in_port=%d", pl.port);
-                        snprintf(fl.actions, sizeof(fl.actions), "meter:1,output:normal");
+                        snprintf(fl.actions, sizeof(fl.actions), "meter:2,output:normal");
                         ovs_add_flow(ctx->bridge, &fl);
                         LOG_W("L2", "Rate limit applied on uplink port %d instead of isolate",
                               pl.port);
@@ -250,24 +259,37 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                     break;
                 }
                 case POLICY_RESTORE_PORT:
+                {
                     ovs_set_port_state(ctx->bridge, ifname, 1);
-                    LOG_I("L2", "Port %d restored", pl.port);
+                    /* Remove the rate-limit flow that was installed by POLICY_RATE_LIMIT.
+                     * Without this deletion, the priority=1 flow stays permanently and
+                     * the port remains metered even after the storm is gone. */
+                    char rl_match[64];
+                    snprintf(rl_match, sizeof(rl_match), "in_port=%d", pl.port);
+                    ovs_del_flow(ctx->bridge, rl_match);
+                    LOG_I("L2", "Port %d restored (rate-limit flow removed)", pl.port);
                     break;
-
+                }                
                 case POLICY_RATE_LIMIT:
                 {
-                    ovs_of_add_meter(ctx->bridge, 1, pl.rate_limit * 2);
+                    /* Use meter 2 for per-port rate limiting.
+                     * Meter 1 is reserved exclusively for broadcast/multicast
+                     * storm protection (1500 kbps). Overwriting meter 1 here
+                     * destroys broadcast protection. pl.rate_limit is in pps,
+                     * not kbps, so multiplying it produces an unintended
+                     * near-unlimited rate. Use a fixed 10 Mbps cap on meter 2. */
+                    ovs_of_add_meter(ctx->bridge, 2, 10000);
                     ovs_flow_t fl = {0};
-                    fl.priority = 200;
+                    fl.priority = 1;
                     snprintf(fl.match, sizeof(fl.match),
                              "in_port=%d", pl.port);
                     snprintf(fl.actions, sizeof(fl.actions),
-                             "meter:1,output:normal");
+                             "meter:2,output:normal");
 
                     ovs_add_flow(ctx->bridge, &fl);
 
-                    LOG_W("L2", "Rate limit applied on port %d (%u pps)",
-                          pl.port, pl.rate_limit);
+                    LOG_W("L2", "Rate limit applied on port %d (10Mbps cap)",
+                          pl.port);
                     break;
                 }
 
@@ -369,7 +391,10 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
               ctx->switch_id, msg->msg_type, msg->src_agent);
         break;
     }
-
+    {
+        extern a2a_metrics_t g_metrics;
+        metrics_record_latency(&g_metrics, ev->data.msg.timestamp_us);
+    }
     /* return to ACTIVE */
     a2a_event_t done = {0};
     done.type = A2A_EV_MSG_RECEIVED;
@@ -488,32 +513,71 @@ void l2_mac_sync(l2_agent_ctx_t *ctx)
                 break;
             }
         }
-        if (!found && ctx->mac_count < L2_MAX_MAC_TABLE)
-        {
-            /* Final dedup guard: scan one more time with explicit length */
+        if (!found) {
+
+            /* Final duplicate check */
             int dup = 0;
-            for (int j = 0; j < ctx->mac_count; j++)
-            {
-                if (strncmp(ctx->mac_table[j].mac, raw[i].mac, 17) == 0)
-                {
-                    /* Found via strncmp (length-limited) — update and skip */
+
+            for (int j = 0; j < ctx->mac_count; j++) {
+                if (strncmp(ctx->mac_table[j].mac, raw[i].mac, 17) == 0) {
                     ctx->mac_table[j].last_seen_us = now;
                     ctx->mac_table[j].port = raw[i].port;
                     dup = 1;
                     break;
                 }
             }
-            if (!dup)
-            {
-                mac_entry_t *e = &ctx->mac_table[ctx->mac_count++];
-                memcpy(e->mac, raw[i].mac, 17);
-                e->mac[17] = '\0';
-                e->port = raw[i].port;
-                e->learned_at_us = now;
-                e->last_seen_us = now;
-                e->pkt_count = 1;
-                LOG_I("L2", "New MAC: %s on port %d", e->mac, e->port);
+
+            if (dup)
+                continue;
+
+            /* Get free slot or evict LRU entry */
+            mac_entry_t *slot = NULL;
+
+            if (ctx->mac_count < L2_MAX_MAC_TABLE) {
+
+                /* Append new entry */
+                slot = &ctx->mac_table[ctx->mac_count++];
+
+            } else {
+
+                /* Find least recently used entry */
+                slot = &ctx->mac_table[0];
+
+                for (int j = 1; j < ctx->mac_count; j++) {
+                    if (ctx->mac_table[j].last_seen_us <
+                        slot->last_seen_us)
+                    {
+                        slot = &ctx->mac_table[j];
+                    }
+                }
+
+                /* Remove stale OVS flow */
+                char evict_match[128];
+
+                snprintf(evict_match, sizeof(evict_match),
+                         "dl_dst=%s", slot->mac);
+
+                ovs_del_flow(ctx->bridge, evict_match);
+
+                LOG_D("L2", "[%s] MAC table full — LRU evict: %s "
+                      "(age=%.1fs, replacing with %s)",
+                      ctx->switch_id, slot->mac,
+                      (double)(now - slot->last_seen_us) / 1e6,
+                      raw[i].mac);
             }
+
+            /* Populate MAC entry */
+            memcpy(slot->mac, raw[i].mac, 17);
+
+            slot->mac[17]       = '\0';
+            slot->port          = raw[i].port;
+            slot->learned_at_us = now;
+            slot->last_seen_us  = now;
+            slot->pkt_count     = 1;
+
+            LOG_I("L2", "[%s] New MAC: %s on port %d (table: %d/%d)",
+                  ctx->switch_id, slot->mac, slot->port,
+                  ctx->mac_count, L2_MAX_MAC_TABLE);
         }
     }
 
@@ -605,8 +669,8 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
     uint64_t now = a2a_now_us();
 
     /* Force explicit thresholds to guarantee test visibility with 5000 pkts */
-    uint64_t thresh_active = 500;
-    uint64_t thresh_clear = 100;
+    uint64_t thresh_active = (uint64_t)STORM_THRESHOLD_PPS;
+    uint64_t thresh_clear = (uint64_t)STORM_CLEAR_PPS;
 
     /* ───── STORM DETECTED ───── */
     if (!ps->storm_active && pps >= thresh_active)
@@ -646,11 +710,17 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
         ps->storm_active = 0;
         LOG_I("L2", "Storm CLEARED port=%d", ps->port_no);
 
-        if (now - ps->last_event_sent_us > 1000000)
-        {
-            l2_report_anomaly(ctx, L2_ANOMALY_STORM_CLEAR, ps->port_no, 0, NULL, "storm_cleared");
-            ps->last_event_sent_us = now;
-        }
+        /*
+         * STORM_CLEAR must always be sent — no rate-limit guard.
+         * The guard fires too early (storm clears ~100ms after detection,
+         * but the guard window is 1s). Suppressing STORM_CLEAR causes
+         * the OVS rate-limit meter flow to stay installed permanently,
+         * keeping the port throttled indefinitely.
+         * STORM_CLEAR is a one-shot state transition (ps->storm_active
+         * is cleared above), so it can only fire once per storm episode.
+         */
+        l2_report_anomaly(ctx, L2_ANOMALY_STORM_CLEAR, ps->port_no, 0, NULL, "storm_cleared");
+        ps->last_event_sent_us = now;
     }
 }
 
@@ -671,33 +741,97 @@ void l2_port_poll(l2_agent_ctx_t *ctx)
         if (rc < 0)
             continue;
 
-        /*  Track if port was ever up */
-        if (stats.link_up)
-        {
+                /* Link state handling with duplicate protection */
+        if (stats.link_up) {
+            /* Mark port as active */
             ps->was_up_ever = 1;
-        }
-        else
-        {
-            /*  Ignore startup false negatives */
+
+            /* Reset one-shot flag after link recovery */
+            if (ps->link_down_reported) {
+                ps->link_down_reported = 0;
+
+                LOG_I("L2", "[%s] Link RESTORED on port %d (%s) "
+                      "— poll path reset",
+                      ctx->switch_id, ps->port_no, ps->ifname);
+
+                if (ps->alternate_active)
+                {
+                    ps->alternate_active = 0;
+                    const char *gateway = l2_get_gateway_ip(ctx->switch_id);
+                    char cmd[256];
+
+                    /*
+                     * Restore: flush MACs learned via alternate path so
+                     * they re-learn on the restored primary uplink.
+                     * No redirect flows to remove (failover doesn't
+                     * install any — OVS NORMAL handles forwarding).
+                     */
+
+                    /* Step 1: Flush learned MAC flows */
+                    ovs_flush_mac(ctx->bridge, NULL);
+
+                    /* Step 2: Restore kernel route */
+                    if (gateway)
+                    {
+                        snprintf(cmd, sizeof(cmd),
+                                 "ip route replace default via %s 2>/dev/null",
+                                 gateway);
+                        (void)system(cmd);
+                    }
+
+                    /* Notify L3 peers that the uplink is back.
+                     * L3 agent uses this to remove the secondary kernel
+                     * routes (metric=50) installed on core routers during
+                     * LINK_DOWN failover. */
+                    l2_report_anomaly(ctx, L2_ANOMALY_LINK_UP,
+                                     ps->port_no, 0, NULL, "link_restored");
+
+                    LOG_I("L2", "[%s] Uplink RESTORED port=%d: "
+                          "flushed MACs, reverted kernel route to %s",
+                          ctx->switch_id, ps->port_no,
+                          gateway ? gateway : "unknown");
+                }
+            }
+
+        } else {
+            /* Ignore startup false negatives */
             if (!ps->was_up_ever)
                 continue;
 
-            /* Real link-down event */
-            if (ps->storm_active)
+            /* Clear storm state on link-down */
+            if (ps->storm_active) {
                 ps->storm_active = 0;
+                ps->current_pps  = 0;
 
-            a2a_event_t ev = {0};
-            ev.type = A2A_EV_OVS_LINK_DOWN;
-            ev.fsm_event = FSM_EVENT_OVS_EVENT;
-            ev.timestamp_us = now;
-            ev.data.ovs.port = ps->port_no;
-            ev.data.ovs.link_down = 1;
+                LOG_D("L2", "[%s] Cleared storm state for downed port %d",
+                      ctx->switch_id, ps->port_no);
+            }
 
-            strncpy(ev.data.ovs.bridge, ctx->bridge,
-                    sizeof(ev.data.ovs.bridge) - 1);
+            /* Fire link-down event only once */
+            if (!ps->link_down_reported) {
+                ps->link_down_reported = 1;
 
-            event_queue_push(&ctx->agent->eq, &ev);
+                LOG_W("L2", "[%s] Link DOWN detected on port %d (%s) "
+                      "— poll path",
+                      ctx->switch_id, ps->port_no, ps->ifname);
 
+                a2a_event_t ev = {0};
+                ev.type            = A2A_EV_OVS_LINK_DOWN;
+                ev.fsm_event       = FSM_EVENT_OVS_EVENT;
+                ev.timestamp_us    = now;
+                ev.data.ovs.port   = ps->port_no;
+                ev.data.ovs.link_down = 1;
+
+                strncpy(ev.data.ovs.bridge, ctx->bridge,
+                        sizeof(ev.data.ovs.bridge) - 1);
+
+                if (event_queue_push(&ctx->agent->eq, &ev) != 0) {
+                    LOG_W("L2", "[%s] Event queue full — dropping link-down "
+                          "for port %d", ctx->switch_id, ps->port_no);
+                }
+            }
+
+            /* Skip PPS checks for down ports */
             continue;
         }
 
@@ -724,6 +858,24 @@ void l2_port_poll(l2_agent_ctx_t *ctx)
         ps->rx_packets_prev = stats.rx_packets;
         ps->last_check_us = now;
         ps->current_pps = (uint32_t)pps;
+
+        /* Monitor broadcast drop rate from OVS meter */
+        if (ps->bcast_rx_prev > 0 && stats.rx_dropped >= ps->bcast_rx_prev) {
+            uint64_t drop_delta = stats.rx_dropped - ps->bcast_rx_prev;
+
+            ps->bcast_drop_pps = (uint32_t)(elapsed_us > 0
+                                 ? drop_delta * 1000000ULL / elapsed_us
+                                 : 0);
+
+            if (ps->bcast_drop_pps > 0) {
+                LOG_D("L2", "[%s] Port %d (%s): broadcast drops=%u pps "
+                      "(meter active)",
+                      ctx->switch_id, ps->port_no, ps->ifname,
+                      ps->bcast_drop_pps);
+            }
+        }
+
+        ps->bcast_rx_prev = stats.rx_dropped;
 
         l2_detect_storm(ctx, i, pps);
     }
@@ -1026,34 +1178,153 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
         free(ctx);
         return NULL;
     }
+
     ctx->agent->userdata = ctx;
+
+    /* Initialize OVSDB buffer */
     ctx->ovsdb_len = 0;
     memset(ctx->ovsdb_buf, 0, sizeof(ctx->ovsdb_buf));
 
-    /* Enumerate bridge ports without popen/system */
-    ctx->port_count = l2_port_enumerate_from_sys(ctx, bridge, use_mock_ovs);
+    /* Discover bridge ports */
+    ctx->port_count =
+        l2_port_enumerate_from_sys(ctx, bridge, use_mock_ovs);
+
     if (ctx->port_count == 0)
+    {
         LOG_W("L2", "[%s] No ports found on bridge %s "
                     "(OVSDB monitor will populate once connected)",
               switch_id, bridge);
+    }
 
-    /* Connect OpenFlow channel eagerly (installs table-miss for MAC learning)
-     * then register the OF fd with our epoll loop so PACKET_IN messages
-     * arrive without polling.  Without this call, MAC learning is dead. */
+    /* Setup OpenFlow + OVSDB connections */
     if (!use_mock_ovs)
     {
-        /* OpenFlow channel (for flows + packet-in) */
-        ovs_of_connect(bridge);
-        ovs_of_register_epoll(ctx->agent->server);
+        /* Connect OpenFlow channel */
+        int of_fd = ovs_of_connect(bridge);
 
-        /* OVSDB CONNECTION */
+        if (of_fd < 0)
+        {
+            LOG_W("L2", "[%s] OpenFlow connect failed — "
+                  "MAC learning disabled",
+                  switch_id);
 
+        } else {
+
+            ovs_of_register_epoll(ctx->agent->server);
+
+            LOG_I("L2", "[%s] OpenFlow connected fd=%d",
+                  switch_id, of_fd);
+
+            /* Install broadcast storm meter */
+            if (ovs_of_add_meter(bridge, 1, 1500) == 0)
+            {
+                LOG_I("L2", "[%s] Storm meter installed "
+                      "(1500 kbps ≈ 1000 pps)",
+                      switch_id);
+            }
+            else
+            {
+                LOG_W("L2", "[%s] Failed to install storm meter — "
+                      "hardware enforcement disabled",
+                      switch_id);
+            }
+
+            /* Broadcast storm protection flow */
+            {
+                ovs_flow_t bcast_fl = {0};
+
+                bcast_fl.priority     = 50;
+                bcast_fl.idle_timeout = 0;
+                bcast_fl.hard_timeout = 0;
+
+                snprintf(bcast_fl.match,
+                         sizeof(bcast_fl.match),
+                         "dl_dst=ff:ff:ff:ff:ff:ff");
+
+                snprintf(bcast_fl.actions,
+                         sizeof(bcast_fl.actions),
+                         "meter:1,output:normal");
+
+                if (ovs_add_flow(bridge, &bcast_fl) == 0)
+                {
+                    ctx->flows_installed++;
+
+                    LOG_I("L2", "[%s] Broadcast storm flow installed "
+                          "(priority=50, meter:1,output:normal)",
+                          switch_id);
+                }
+                else
+                {
+                    LOG_W("L2", "[%s] Failed to install "
+                          "broadcast storm flow",
+                          switch_id);
+                }
+            }
+
+            /* Multicast storm protection flow */
+            {
+                ovs_flow_t mcast_fl = {0};
+
+                mcast_fl.priority     = 45;
+                mcast_fl.idle_timeout = 0;
+                mcast_fl.hard_timeout = 0;
+
+                snprintf(mcast_fl.match,
+                         sizeof(mcast_fl.match),
+                         "dl_dst=01:00:00:00:00:00/"
+                         "01:00:00:00:00:00");
+
+                snprintf(mcast_fl.actions,
+                         sizeof(mcast_fl.actions),
+                         "meter:1,output:normal");
+
+                if (ovs_add_flow(bridge, &mcast_fl) == 0)
+                {
+                    ctx->flows_installed++;
+
+                    LOG_I("L2", "[%s] Multicast storm flow installed "
+                          "(priority=45, meter:1,output:normal)",
+                          switch_id);
+                }
+                else
+                {
+                    LOG_W("L2", "[%s] Failed to install "
+                          "multicast storm flow",
+                          switch_id);
+                }
+            }
+
+            /* No catch-all forwarding flow is installed here.
+             *
+             * Unknown destination MAC packets must hit the
+             * OpenFlow table-miss rule (priority=0 -> CONTROLLER),
+             * generating PACKET_IN events for the L2 agent.
+             *
+             * The agent then performs:
+             *   1. source MAC learning
+             *   2. MAC-to-port mapping
+             *   3. dynamic dl_dst flow installation
+             *
+             * Learned destination flows are installed later at
+             * higher priority (priority=10).
+             *
+             * This ensures forwarding decisions remain fully
+             * controller-driven instead of bypassing logic through
+             * OVS NORMAL switching behavior.
+             */
+            LOG_I("L2",
+                  "[%s] Dynamic MAC learning enabled via PACKET_IN",
+                  switch_id);
+        }
+
+        /* OVSDB connection */
         int ovsdb_fd = ovsdb_connect();
+
         if (ovsdb_fd >= 0)
         {
             ovsdb_send_monitor(ovsdb_fd);
 
-            /* enable ovs_set_port_state() */
+            /* Enable ovs_set_port_state() */
             ovs_set_ovsdb_fd(ovsdb_fd);
 
             a2a_server_add_fd(ctx->agent->server, ovsdb_fd);
@@ -1064,19 +1335,24 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
                 l2_ovsdb_epoll_handler,
                 ctx);
 
-            LOG_I("L2", "[%s] OVSDB connected fd=%d", switch_id, ovsdb_fd);
+            LOG_I("L2", "[%s] OVSDB connected fd=%d",
+                  switch_id, ovsdb_fd);
         }
         else
         {
-            LOG_W("L2", "[%s] OVSDB connect failed", switch_id);
+            LOG_W("L2", "[%s] OVSDB connect failed",
+                  switch_id);
         }
     }
 
     l2_agent_init_fsm(ctx);
 
-    LOG_I("L2", "[%s] Created bridge=%s addr=%s:%d ports=%d OVS=%s",
-          switch_id, bridge, host, port, ctx->port_count,
+    LOG_I("L2", "[%s] Created bridge=%s addr=%s:%d "
+          "ports=%d OVS=%s",
+          switch_id, bridge, host, port,
+          ctx->port_count,
           use_mock_ovs ? "mock" : "real");
+
     return ctx;
 }
 
@@ -1090,23 +1366,118 @@ void l2_agent_destroy(l2_agent_ctx_t *ctx)
 
 void l2_print_table(l2_agent_ctx_t *ctx)
 {
-    printf("\n[L2:%s] MAC Table (%d entries):\n",
-           ctx->switch_id, ctx->mac_count);
-    printf("  %-20s %-6s %-10s\n", "MAC", "PORT", "PKTS");
-    printf("  %-20s %-6s %-10s\n", "---", "----", "----");
+    /*
+     * Use structured logging instead of printf().
+     *
+     * In detached Docker/container execution,
+     * stdout may not appear in runtime logs.
+     *
+     * LOG_I() ensures:
+     *   - docker logs visibility
+     *   - centralized logging
+     *   - timestamped structured output
+     *   - production-grade observability
+     */
+
+    LOG_I("L2",
+          "[%s] MAC Table (%d entries):",
+          ctx->switch_id,
+          ctx->mac_count);
+
+    LOG_I("L2",
+          "  %-20s %-6s %-10s",
+          "MAC",
+          "PORT",
+          "PKTS");
+
+    LOG_I("L2",
+          "  %-20s %-6s %-10s",
+          "---",
+          "----",
+          "----");
+
     for (int i = 0; i < ctx->mac_count; i++)
-        printf("  %-20s %-6d %-10u\n",
-               ctx->mac_table[i].mac,
-               ctx->mac_table[i].port,
-               ctx->mac_table[i].pkt_count);
+    {
+        LOG_I("L2",
+              "  %-20s %-6d %-10u",
+              ctx->mac_table[i].mac,
+              ctx->mac_table[i].port,
+              ctx->mac_table[i].pkt_count);
+    }
 }
+/* ── Topology helpers ────────────────────────────────────────────────── */
+/*
+ * Return the inter-switch port name for a given switch.
+ * Topology: sw1 ↔ sw2 via s1s2/s2s1, sw3 ↔ sw4 via s3s4/s4s3, etc.
+ * This is the port we redirect traffic to when the uplink fails.
+ */
+static const char *l2_get_interswitch_port(const char *switch_id)
+{
+    if (strcmp(switch_id, "sw1") == 0) return "s1s2";
+    if (strcmp(switch_id, "sw2") == 0) return "s2s1";
+    if (strcmp(switch_id, "sw3") == 0) return "s3s4";
+    if (strcmp(switch_id, "sw4") == 0) return "s4s3";
+    if (strcmp(switch_id, "sw5") == 0) return "s5s6";
+    if (strcmp(switch_id, "sw6") == 0) return "s6s5";
+    if (strcmp(switch_id, "sw7") == 0) return "s7s8";
+    if (strcmp(switch_id, "sw8") == 0) return "s8s7";
+    return NULL;
+}
+
+static const char *l2_get_neighbor_ip(const char *switch_id)
+{
+    if (strcmp(switch_id, "sw1") == 0) return "10.0.0.252";
+    if (strcmp(switch_id, "sw2") == 0) return "10.0.0.251";
+    if (strcmp(switch_id, "sw3") == 0) return "20.0.0.252";
+    if (strcmp(switch_id, "sw4") == 0) return "20.0.0.251";
+    if (strcmp(switch_id, "sw5") == 0) return "30.0.0.252";
+    if (strcmp(switch_id, "sw6") == 0) return "30.0.0.251";
+    if (strcmp(switch_id, "sw7") == 0) return "40.0.0.252";
+    if (strcmp(switch_id, "sw8") == 0) return "40.0.0.251";
+    return NULL;
+}
+
+static const char *l2_get_gateway_ip(const char *switch_id)
+{
+    if (strcmp(switch_id, "sw1") == 0 ||
+        strcmp(switch_id, "sw2") == 0) return "10.0.0.254";
+    if (strcmp(switch_id, "sw3") == 0 ||
+        strcmp(switch_id, "sw4") == 0) return "20.0.0.254";
+    if (strcmp(switch_id, "sw5") == 0 ||
+        strcmp(switch_id, "sw6") == 0) return "30.0.0.254";
+    if (strcmp(switch_id, "sw7") == 0 ||
+        strcmp(switch_id, "sw8") == 0) return "40.0.0.254";
+    return NULL;
+}
+
 void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
 {
     int port = ev->data.ovs.port;
 
+    /*
+     * Idempotency guard — prevents double execution when both OVSDB
+     * monitor and l2_port_poll() detect the same link-down event.
+     * Once alternate_active=1 is set, any subsequent call for the
+     * same port is a no-op. This is the authoritative guard; the
+     * link_down_reported flag in the callers is best-effort.
+     */
+    for (int _i = 0; _i < ctx->port_count; _i++)
+    {
+        if (ctx->ports[_i].port_no == port)
+        {
+            if (ctx->ports[_i].alternate_active)
+            {
+                LOG_D("L2", "[%s] link_down port=%d: already in alternate mode — skip",
+                      ctx->switch_id, port);
+                return;
+            }
+            break;
+        }
+    }
+
     LOG_E("L2", "Link DOWN on port %d — notifying L3 peers", port);
 
-    /* Mark storm cleared */
+    /* Mark storm cleared on this port */
     for (int i = 0; i < ctx->port_count; i++)
     {
         if (ctx->ports[i].port_no == port)
@@ -1116,13 +1487,131 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
         }
     }
 
-    /* send typed anomaly */
-    l2_report_anomaly(ctx,
-                      L2_ANOMALY_LINK_DOWN,
-                      port,
-                      0,
-                      NULL,
-                      "link_down");
+    /*
+     * Intra-subnet alternate path when uplink fails.
+     *
+     * The failing port must be the uplink (core-facing). Uplink port names
+     * follow the pattern sNcN (e.g., s1c1). Host-facing ports are sNhN.
+     * Inter-switch ports are sNsN. We detect uplinks by 'c' after a digit.
+     *
+     * When sw1's uplink (s1c1, port 1) goes down:
+     *   Physical alternate: sw1 → s1s2 → sw2 → s2c1 → core1(c1s2 kernel)
+     *
+     * Two actions needed:
+     *   1. OVS: redirect all existing flows pointing to the dead port
+     *      to the inter-switch port instead. This covers:
+     *      - dl_dst=core1_MAC → was output:1, must become output:5
+     *      - ip,nw_dst=X.X.X.0/24 flows (will be re-matched by NORMAL)
+     *   2. Kernel: redirect default route via neighbor switch IP so that
+     *      sw1's own kernel-originated packets (ARP, etc.) also use the
+     *      alternate path.
+     */
+    int is_uplink = 0;
+    const char *uplink_ifname = NULL;
+
+    for (int i = 0; i < ctx->port_count; i++)
+    {
+        if (ctx->ports[i].port_no != port)
+            continue;
+        uplink_ifname = ctx->ports[i].ifname;
+        /* Uplink: pattern is sNcN — has 'c' after a digit */
+        size_t nl = strlen(uplink_ifname);
+        for (size_t ci = 1; ci < nl; ci++)
+        {
+            if (uplink_ifname[ci] == 'c' &&
+                uplink_ifname[ci-1] >= '1' &&
+                uplink_ifname[ci-1] <= '9')
+            {
+                is_uplink = 1;
+                break;
+            }
+        }
+        break;
+    }
+
+    if (is_uplink)
+    {
+        const char *isw_port  = l2_get_interswitch_port(ctx->switch_id);
+        const char *neighbor  = l2_get_neighbor_ip(ctx->switch_id);
+        const char *gateway   = l2_get_gateway_ip(ctx->switch_id);
+
+        /* Find the OVS ofport number of the inter-switch port */
+        int isw_ofport = -1;
+        if (isw_port)
+        {
+            for (int i = 0; i < ctx->port_count; i++)
+            {
+                if (strcmp(ctx->ports[i].ifname, isw_port) == 0)
+                {
+                    isw_ofport = ctx->ports[i].port_no;
+                    break;
+                }
+            }
+        }
+
+        if (isw_ofport > 0 && neighbor)
+        {
+            /*
+             * Failover strategy — OVS NORMAL handles rerouting:
+             *
+             * 1. Flush learned MAC flows. After flush, all unknown-dst
+             *    packets hit table-miss → CONTROLLER → PACKET_IN.
+             *    The agent replies with PACKET_OUT(NORMAL). OVS NORMAL
+             *    floods to all UP ports — since s1c1 is DOWN, OVS
+             *    automatically excludes it from the flood set.
+             *    Packets reach core1 via s1s2→sw2→s2c1→c1s2.
+             *
+             * 2. Do NOT install catch-all IP/ARP redirect flows.
+             *    priority=8 ip and priority=15 arp would override
+             *    table-miss for ALL traffic including local same-switch
+             *    packets (host1→host3), breaking intra-switch connectivity.
+             *    OVS standalone fail_mode already handles dead port
+             *    exclusion during NORMAL flooding.
+             *
+             * 3. Change kernel route so sw1's own kernel-originated
+             *    packets (OSPF, management) use the alternate next-hop.
+             */
+
+            /* Step 1: Flush learned MAC flows — forces re-learning */
+            ovs_flush_mac(ctx->bridge, NULL);
+
+            LOG_I("L2", "[%s] Uplink DOWN port=%d: flushed MACs, "
+                  "OVS NORMAL will flood via %s(ofport=%d)",
+                  ctx->switch_id, port, isw_port, isw_ofport);
+
+            /* Step 2: Kernel route redirect for sw1's own traffic */
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd),
+                     "ip route replace default via %s 2>/dev/null",
+                     neighbor);
+            (void)system(cmd);
+
+            LOG_I("L2", "[%s] Alternate path: kernel route → %s, "
+                  "OVS flood via port %d",
+                  ctx->switch_id, neighbor, isw_ofport);
+
+            /* Mark alternate active on this port */
+            for (int i = 0; i < ctx->port_count; i++)
+            {
+                if (ctx->ports[i].port_no == port)
+                {
+                    ctx->ports[i].alternate_active = 1;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            LOG_W("L2", "[%s] Cannot install alternate: isw_ofport=%d "
+                  "neighbor=%s gateway=%s",
+                  ctx->switch_id, isw_ofport,
+                  neighbor ? neighbor : "NULL",
+                  gateway ? gateway : "NULL");
+        }
+    }
+
+    /* Notify L3 peers */
+    l2_report_anomaly(ctx, L2_ANOMALY_LINK_DOWN, port, 0, NULL, "link_down");
 }
 static void l2_report_anomaly(l2_agent_ctx_t *ctx,
                               int anomaly_type,

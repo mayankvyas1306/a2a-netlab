@@ -31,14 +31,21 @@ typedef struct
 
 typedef struct
 {
-    int port_no;
+    int      port_no;
     uint64_t rx_packets_prev;
     uint64_t last_check_us;
     uint64_t last_event_sent_us;
-    int storm_active;
+    int      storm_active;
     uint32_t current_pps;
-    char ifname[64];
-    int was_up_ever;
+    char     ifname[64];
+    int      was_up_ever;
+
+    /* Prevent duplicate link-down events */
+    int      link_down_reported;  /* 1 = already reported */
+    int alternate_active;    /* 1 if kernel alternate route is installed */
+    /* Broadcast drop tracking */
+    uint64_t bcast_rx_prev;    /* previous rx_dropped value */
+    uint32_t bcast_drop_pps;   /* broadcast drops per second */
 } port_state_t;
 
 typedef struct

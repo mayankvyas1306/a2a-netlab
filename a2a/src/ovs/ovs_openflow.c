@@ -34,6 +34,7 @@
 
 /* Forward declarations */
 void ovs_of_process_packet_in(const char *bridge, int fd);
+static int of_install_table_miss(int fd, const char *bridge);
 
 /* ── OpenFlow 1.3 wire constants ─────────────────────────────────── */
 
@@ -305,7 +306,7 @@ static int of_install_table_miss(int fd, const char *bridge)
 
     ofp_action_output_t *act_out = (ofp_action_output_t *)(buf + off);
     act_out->type = htons(OFPAT_OUTPUT);
-    act_out->len = htons(sizeof(ofp_action_output_t));
+    act_out->len  = htons(sizeof(ofp_action_output_t));
     act_out->port = htonl(OFPP_CONTROLLER);
     act_out->max_len = htons(0xffff);
     off += sizeof(ofp_action_output_t);
@@ -553,7 +554,9 @@ static int build_flow_mod(const ovs_flow_t *flow, uint8_t command,
         uint8_t eth_type[2] = {0x08, 0x00};
         oxm_put(buf, &off, bufsz, OXM_OF_ETH_TYPE, eth_type, 2);
     }
-    else if (strstr(mstr, "dl_type=0x0806"))
+    else if (strstr(mstr, "dl_type=0x0806") ||
+             strstr(mstr, "arp,") || strstr(mstr, ",arp") ||
+             strcmp(mstr, "arp") == 0)
     {
         uint8_t eth_type[2] = {0x08, 0x06};
         oxm_put(buf, &off, bufsz, OXM_OF_ETH_TYPE, eth_type, 2);
@@ -611,6 +614,36 @@ static int build_flow_mod(const ovs_flow_t *flow, uint8_t command,
         uint8_t mac[6];
         if (parse_mac(p + 7, mac) == 0)
             oxm_put(buf, &off, bufsz, OXM_OF_ETH_SRC, mac, 6);
+    }
+
+    p = strstr(mstr, "arp_tpa=");
+    if (p)
+    {
+        /* OXM_OF_ARP_TPA = 0x80002c04 (class=OPENFLOW_BASIC, field=22, len=4) */
+        uint32_t ip = 0;
+        struct in_addr a;
+        char ip_str[24];
+        const char *ip_start = p + 8;
+        /* Copy IP string (up to next comma or end) */
+        int k = 0;
+        while (ip_start[k] && ip_start[k] != ',' && k < 23)
+        {
+            ip_str[k] = ip_start[k];
+            k++;
+        }
+        ip_str[k] = '\0';
+        if (inet_pton(AF_INET, ip_str, &a) == 1)
+        {
+            ip = a.s_addr; /* already big-endian */
+            uint32_t oxm_hdr = htonl(0x80002c04); /* OXM_OF_ARP_TPA, len=4 */
+            if (off + 4 + 4 <= bufsz)
+            {
+                memcpy(buf + off, &oxm_hdr, 4);
+                off += 4;
+                memcpy(buf + off, &ip, 4);
+                off += 4;
+            }
+        }
     }
 
     int match_len = off - match_start;
@@ -897,6 +930,35 @@ int ovs_of_add_flow(const char *bridge, const ovs_flow_t *flow)
     return 0;
 }
 
+/*
+ * ovs_of_del_flow_at_priority — DELETE_STRICT for a specific priority.
+ * Use this instead of ovs_of_del_flow when you know the exact priority
+ * to avoid accidentally deleting flows at other priorities.
+ */
+int ovs_of_del_flow_at_priority(const char *bridge, const char *match,
+                                uint16_t priority)
+{
+    of_conn_t *c = of_get_conn(bridge);
+    if (!c)
+        return -1;
+
+    ovs_flow_t flow = {0};
+    strncpy(flow.match, match, sizeof(flow.match) - 1);
+    flow.priority = priority;
+
+    uint8_t buf[512];
+    int len = build_flow_mod(&flow, OFPFC_DELETE_STRICT, buf, sizeof(buf));
+    if (len < 0)
+        return -1;
+
+    if (send(c->fd, buf, len, MSG_NOSIGNAL) < 0)
+        return -1;
+
+    LOG_I("OF", "[%s] FLOW_MOD DELETE_STRICT priority=%u match=%s",
+          bridge, priority, match);
+    return 0;
+}
+
 int ovs_of_del_flow(const char *bridge, const char *match)
 {
     int fd = ovs_of_connect(bridge);
@@ -935,9 +997,133 @@ int ovs_of_list_flows(const char *bridge, ovs_flow_t *out, int max)
     return 0;
 }
 
+/*
+ * ovs_of_flush_mac — Delete all learned MAC forwarding flows (priority=10).
+ *
+ * Strategy: install all learned MAC flows with cookie=0xA2A00000A2A00000.
+ * Flush using DELETE non-strict with cookie+mask. This is the only reliable
+ * way to delete a specific subset of flows in OpenFlow 1.3 without affecting
+ * other priority levels.
+ *
+ * Since we cannot retroactively cookie existing flows, we use a two-step
+ * approach:
+ *   1. DELETE non-strict, empty OXM, cookie=0/mask=0 — this deletes ALL
+ *      flows in the table. Then immediately reinstall the permanent
+ *      protection flows (priority=50 bcast, priority=45 mcast, priority=0
+ *      table-miss). This is safe because these flows are reinstalled
+ *      atomically before any new traffic arrives.
+ *
+ * This approach is chosen over STRICT+empty-match because OF1.3 DELETE
+ * STRICT with empty OXM only matches flows that were installed with an
+ * empty OXM match — it does NOT wildcard across all installed flows.
+ */
 int ovs_of_flush_mac(const char *bridge)
 {
-    return ovs_of_del_flow(bridge, "*");
+    of_conn_t *c = of_get_conn(bridge);
+    if (!c)
+        return -1;
+
+    /*
+     * Step 1: DELETE non-strict with out_port=OFPP_ANY, empty OXM.
+     * This deletes ALL flows in table 0. We will reinstall permanent
+     * flows immediately after.
+     *
+     * Why not filter by priority=10? OF1.3 DELETE non-strict does NOT
+     * filter by priority — it matches any flow whose OXM is a superset
+     * of the specified OXM. With empty OXM, all flows match.
+     *
+     * IMPORTANT: We exclude priority=0 (table-miss) by NOT deleting it
+     * separately — instead we reinstall it immediately below.
+     */
+    uint8_t buf[128];
+    memset(buf, 0, sizeof(buf));
+
+    ofp_flow_mod_t *fm = (ofp_flow_mod_t *)buf;
+    int off = sizeof(ofp_flow_mod_t);
+
+    fm->header.version  = OFP13_VERSION;
+    fm->header.type     = OFPT_FLOW_MOD;
+    fm->cookie          = 0;
+    fm->cookie_mask     = 0;
+    fm->table_id        = 0;
+    fm->command         = OFPFC_DELETE;        /* non-strict: match all */
+    fm->idle_timeout    = 0;
+    fm->hard_timeout    = 0;
+    fm->priority        = 0;                   /* ignored for non-strict */
+    fm->buffer_id       = htonl(OFP_NO_BUFFER);
+    fm->out_port        = htonl(OFPP_ANY);
+    fm->out_group       = htonl(0xffffffff);
+
+    /* Empty OXM match = wildcard all */
+    ofp_match_t *match  = (ofp_match_t *)(buf + off);
+    match->type         = htons(OFPMT_OXM);
+    match->length       = htons(4);
+    off += 4;
+    off += 4; /* 8-byte pad */
+
+    fm->header.length = htons((uint16_t)off);
+
+    if (send(c->fd, buf, off, MSG_NOSIGNAL) < 0)
+    {
+        LOG_E("OF", "[%s] flush_mac: DELETE all flows failed errno=%d",
+              bridge, errno);
+        return -1;
+    }
+
+    LOG_I("OF", "[%s] flush_mac: all flows deleted, reinstalling permanent flows",
+          bridge);
+
+    /* Reset in-memory MAC table so re-learning reinstalls dl_dst flows */
+    g_mac_count = 0;
+    memset(g_mac_table, 0, sizeof(g_mac_table));
+
+    /*
+     * Step 2: Reinstall permanent flows that must always be present.
+     * These are wiped by the DELETE above and MUST be reinstalled
+     * before returning, because the first packet after flush must
+     * hit table-miss → CONTROLLER or the broadcast/mcast protection.
+     *
+     * Reinstall in priority order: table-miss first (lowest), then
+     * protection flows (higher priority, installed after).
+     */
+
+    /* Table-miss: priority=0, actions=CONTROLLER */
+    int of_install_table_miss(int fd, const char *bridge);
+    if (of_install_table_miss(c->fd, bridge) < 0)
+    {
+        LOG_E("OF", "[%s] flush_mac: FAILED to reinstall table-miss", bridge);
+        return -1;
+    }
+
+    /* Broadcast storm protection: priority=50 */
+    {
+        ovs_flow_t bcast_fl = {0};
+        bcast_fl.priority     = 50;
+        bcast_fl.idle_timeout = 0;
+        bcast_fl.hard_timeout = 0;
+        snprintf(bcast_fl.match, sizeof(bcast_fl.match),
+                 "dl_dst=ff:ff:ff:ff:ff:ff");
+        snprintf(bcast_fl.actions, sizeof(bcast_fl.actions),
+                 "meter:1,output:normal");
+        ovs_of_add_flow(bridge, &bcast_fl);
+    }
+
+    /* Multicast storm protection: priority=45 */
+    {
+        ovs_flow_t mcast_fl = {0};
+        mcast_fl.priority     = 45;
+        mcast_fl.idle_timeout = 0;
+        mcast_fl.hard_timeout = 0;
+        snprintf(mcast_fl.match, sizeof(mcast_fl.match),
+                 "dl_dst=01:00:00:00:00:00/01:00:00:00:00:00");
+        snprintf(mcast_fl.actions, sizeof(mcast_fl.actions),
+                 "meter:1,output:normal");
+        ovs_of_add_flow(bridge, &mcast_fl);
+    }
+
+    LOG_I("OF", "[%s] flush_mac: permanent flows reinstalled (table-miss, bcast, mcast)",
+          bridge);
+    return 0;
 }
 
 /* ── PACKET_IN handler — real MAC learning ───────────────────────── */
@@ -1056,7 +1242,7 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
     ofp_action_output_t *ao = (ofp_action_output_t *)(buf + off);
     ao->type = htons(OFPAT_OUTPUT);
     ao->len = htons(sizeof(*ao));
-    ao->port = htonl(OFPP_FLOOD);
+    ao->port = htonl(OFPP_NORMAL);
     ao->max_len = htons(0xffff);
     off += sizeof(*ao);
 

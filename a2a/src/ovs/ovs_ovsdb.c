@@ -52,13 +52,7 @@ typedef struct
 
 static ovsdb_iface_shadow_t g_ifaces[OVSDB_MAX_IFACES];
 
-typedef struct {
-    char name[64];
-    int was_up;
-    int valid;
-} link_state_cache_t;
 
-static link_state_cache_t g_link_cache[OVSDB_MAX_IFACES];
 
 /* Find or allocate an entry in the interface shadow table */
 static ovsdb_iface_shadow_t *iface_find_or_alloc(const char *name)
@@ -348,101 +342,48 @@ static void process_interface_table(cJSON *iface_table, a2a_agent_t *agent)
         iface->link_up = is_up;
         int port_no = iface->ofport > 0 ? iface->ofport : prev_ofport;
 
-        LOG_D("OVSDB", "Interface updated: %s ofport=%d link=%s",
+        LOG_I("OVSDB", "Interface updated: %s ofport=%d link=%s",
               iface->name, port_no, iface->link_up ? "up" : "down");
 
         if (was_up && !iface->link_up && agent && agent->card.type == AGENT_TYPE_L2 && agent->userdata) {
             l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;
             if (port_no > 0) {
-                LOG_W("OVSDB", "LINK DOWN: if=%s ofport=%d", iface->name, port_no);
-                a2a_event_t ev = {0};
-                ev.type = A2A_EV_OVS_LINK_DOWN;
-                ev.fsm_event = FSM_EVENT_OVS_EVENT;
-                ev.timestamp_us = a2a_now_us();
-                ev.data.ovs.port = port_no;
-                ev.data.ovs.link_down = 1;
-                snprintf(ev.data.ovs.bridge, sizeof(ev.data.ovs.bridge), "%s", ctx->bridge);
-                event_queue_push(&agent->eq, &ev);
-            }
-        }
-    }
-}
-static void check_link_state_changes(a2a_agent_t *agent)
-{
-    if (!agent || !agent->userdata) return;
-    if (agent->card.type != AGENT_TYPE_L2) return;
-
-    l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;
-
-    for (int i = 0; i < OVSDB_MAX_IFACES; i++)
-    {
-        if (!g_ifaces[i].valid) continue;
-
-        const char *ifname = g_ifaces[i].name;
-        int now_up = g_ifaces[i].link_up;
-
-        int found = 0;
-
-        for (int j = 0; j < OVSDB_MAX_IFACES; j++)
-        {
-            if (!g_link_cache[j].valid) continue;
-            if (strcmp(g_link_cache[j].name, ifname) != 0) continue;
-
-            found = 1;
-
-            if (g_link_cache[j].was_up && !now_up)
-            {
-                /*  LINK DOWN DETECTED */
-
-                int port_no = -1;
-                for (int k = 0; k < ctx->port_count; k++)
+                /*
+                 * Check link_down_reported to prevent duplicate events.
+                 * l2_port_poll() is the primary detection path and sets
+                 * link_down_reported=1 after firing. The OVSDB monitor is
+                 * a faster path (fires before the next poll cycle). Use
+                 * OVSDB as primary: set link_down_reported here so poll
+                 * path does not fire a duplicate event.
+                 */
+                int already_reported = 0;
+                for (int pi = 0; pi < ctx->port_count; pi++)
                 {
-                    if (strcmp(ctx->ports[k].ifname, ifname) == 0)
+                    if (ctx->ports[pi].port_no == port_no)
                     {
-                        port_no = ctx->ports[k].port_no;
+                        already_reported = ctx->ports[pi].link_down_reported;
+                        if (!already_reported)
+                            ctx->ports[pi].link_down_reported = 1;
                         break;
                     }
                 }
-
-                if (port_no >= 0)
+                if (already_reported)
                 {
-                    LOG_W("OVSDB", "Link DOWN detected: if=%s port=%d", ifname, port_no);
-
+                    LOG_D("OVSDB", "LINK DOWN dedup: if=%s ofport=%d (already reported)",
+                          iface->name, port_no);
+                }
+                else
+                {
+                    LOG_W("OVSDB", "LINK DOWN: if=%s ofport=%d", iface->name, port_no);
                     a2a_event_t ev = {0};
                     ev.type = A2A_EV_OVS_LINK_DOWN;
                     ev.fsm_event = FSM_EVENT_OVS_EVENT;
                     ev.timestamp_us = a2a_now_us();
                     ev.data.ovs.port = port_no;
                     ev.data.ovs.link_down = 1;
-
-                    snprintf(ev.data.ovs.bridge,
-                             sizeof(ev.data.ovs.bridge),
-                             "%s", ctx->bridge);
-
+                    snprintf(ev.data.ovs.bridge, sizeof(ev.data.ovs.bridge), "%s", ctx->bridge);
                     event_queue_push(&agent->eq, &ev);
                 }
-            }
-            else if (!g_link_cache[j].was_up && now_up)
-            {
-                LOG_I("OVSDB", "Link UP: if=%s", ifname);
-            }
-
-            g_link_cache[j].was_up = now_up;
-            break;
-        }
-
-        if (!found)
-        {
-            for (int j = 0; j < OVSDB_MAX_IFACES; j++)
-            {
-                if (g_link_cache[j].valid) continue;
-
-                strncpy(g_link_cache[j].name, ifname,
-                        sizeof(g_link_cache[j].name) - 1);
-
-                g_link_cache[j].was_up = now_up;
-                g_link_cache[j].valid = 1;
-                break;
             }
         }
     }
@@ -496,20 +437,13 @@ static void process_port_table(cJSON *port_table, a2a_agent_t *agent)
 
         if (strcmp(state, "down") == 0)
         {
-            a2a_event_t ev = {0};
-            ev.type = A2A_EV_OVS_LINK_DOWN;
-            ev.fsm_event = FSM_EVENT_OVS_EVENT;
-            ev.timestamp_us = a2a_now_us();
-            ev.data.ovs.port = port_no;
-            ev.data.ovs.link_down = 1;
-            snprintf(ev.data.ovs.bridge, sizeof(ev.data.ovs.bridge),
-                     "%s", ctx->bridge);
-
-            if (event_queue_push(&agent->eq, &ev) != 0)
-                LOG_W("OVSDB", "Event queue full, dropping LINK_DOWN port=%d",
-                      port_no);
-            else
-                LOG_W("OVSDB", "LINK DOWN: if=%s port=%d", ifname, port_no);
+            /* Interface table already fires A2A_EV_OVS_LINK_DOWN when it
+             * detects link_state change. The Port table is a duplicate path.
+             * Log only — do not push a second event. The poll path in
+             * l2_port_poll() serves as the third (deduplicated) detection
+             * mechanism via link_down_reported flag. */
+            LOG_W("OVSDB", "Port table: LINK DOWN if=%s port=%d (no duplicate event)",
+                  ifname, port_no);
         }
         else if (strcmp(state, "up") == 0)
         {
@@ -579,7 +513,6 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent)
         agent->userdata)
     {
         l2_sync_ports_from_ovsdb((l2_agent_ctx_t *)agent->userdata);
-        check_link_state_changes(agent);
     }
 
     cJSON_Delete(root);
@@ -587,23 +520,72 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent)
 
 
 /*
- * ovsdb_transact_set_admin_state — set Interface admin_state via OVSDB.
- * Sends a JSON-RPC "transact" mutation to set admin_state "up" or "down".
+ * Set interface admin_state through OVSDB JSON-RPC.
  */
 int ovsdb_set_admin_state(int ovsdb_fd, const char *ifname, int up)
 {
-    if (ovsdb_fd < 0) return -1;
+    if (ovsdb_fd < 0) {
+        LOG_E("OVSDB", "ovsdb_set_admin_state: invalid fd=%d", ovsdb_fd);
+        return -1;
+    }
 
-    char req[768];
-    snprintf(req, sizeof(req),
-        "{\"method\":\"transact\",\"params\":"
-        "[\"Open_vSwitch\","
-        "[{\"op\":\"mutate\",\"table\":\"Interface\","
-        "\"where\":[[\"name\",\"==\",\"%s\"]],"
-        "\"mutations\":[[\"admin_state\",\"=\",\"%s\"]]}]],"
-        "\"id\":100}\n",
-        ifname, up ? "up" : "down");
+    if (!ifname || ifname[0] == '\0') {
+        LOG_E("OVSDB", "ovsdb_set_admin_state: empty ifname");
+        return -1;
+    }
 
-    ssize_t n = send(ovsdb_fd, req, strlen(req), MSG_NOSIGNAL);
-    return (n > 0) ? 0 : -1;
+    /* Generate unique request ID */
+    unsigned long long req_id =
+        (unsigned long long)(a2a_now_us() % 1000000ULL);
+
+    char req[512];
+
+    int req_len = snprintf(req, sizeof(req),
+        "{"
+          "\"method\":\"transact\","
+          "\"params\":["
+            "\"Open_vSwitch\","
+            "[{"
+              "\"op\":\"update\","
+              "\"table\":\"Interface\","
+              "\"where\":[[\"name\",\"==\",\"%s\"]],"
+              "\"row\":{\"admin_state\":\"%s\"}"
+            "}]"
+          "],"
+          "\"id\":%llu"
+        "}\n",
+        ifname,
+        up ? "up" : "down",
+        req_id);
+
+    /* Check request buffer size */
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        LOG_E("OVSDB", "ovsdb_set_admin_state: request buffer overflow "
+              "(ifname='%s')", ifname);
+        return -1;
+    }
+
+    /* Send OVSDB request */
+    ssize_t n = send(ovsdb_fd, req, (size_t)req_len, MSG_NOSIGNAL);
+
+    if (n < 0) {
+        LOG_E("OVSDB", "ovsdb_set_admin_state: send failed errno=%d "
+              "(ifname='%s', state=%s)",
+              errno, ifname, up ? "up" : "down");
+        return -1;
+    }
+
+    /* Guard against partial sends */
+    if (n < req_len) {
+        LOG_W("OVSDB", "ovsdb_set_admin_state: partial send %zd/%d bytes",
+              n, req_len);
+        return -1;
+    }
+
+    LOG_D("OVSDB", "ovsdb_set_admin_state: %s → %s "
+          "(req_id=%llu, fd=%d)",
+          ifname, up ? "up" : "down",
+          req_id, ovsdb_fd);
+
+    return 0;
 }

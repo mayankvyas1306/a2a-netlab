@@ -24,6 +24,7 @@ add_executable(a2a_agent
     # Serialization
     src/common/a2a_serialize.c
     src/common/a2a_log.c
+    src/common/a2a_metrics.c
 
     # L2 agent
     src/l2_agent/l2_agent.c
