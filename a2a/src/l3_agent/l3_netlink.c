@@ -234,25 +234,43 @@ static void handle_link_change(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx,
 static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
 {
     struct ndmsg *ndm = NLMSG_DATA(nlh);
+
     if (ndm->ndm_family != AF_INET)
         return;
+
     if (!(ndm->ndm_state & (NUD_REACHABLE | NUD_STALE |
-                            NUD_DELAY | NUD_PROBE | NUD_PERMANENT)))
+                            NUD_DELAY | NUD_PROBE |
+                            NUD_PERMANENT)))
         return;
 
     uint32_t ip = 0;
     uint8_t mac[6] = {0};
     int has_ip = 0, has_mac = 0;
 
-    struct rtattr *rta = (struct rtattr *)((uint8_t *)ndm + sizeof(struct ndmsg));
-    int rta_len = (int)NLMSG_PAYLOAD(nlh, sizeof(struct ndmsg));
+    struct rtattr *rta =
+        (struct rtattr *)((uint8_t *)ndm +
+                          sizeof(struct ndmsg));
 
-    for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len))
+    int rta_len =
+        (int)NLMSG_PAYLOAD(nlh,
+                           sizeof(struct ndmsg));
+
+    for (; RTA_OK(rta, rta_len);
+         rta = RTA_NEXT(rta, rta_len))
     {
-        if (rta->rta_type == NDA_DST && RTA_PAYLOAD(rta) == 4)
-        { memcpy(&ip, RTA_DATA(rta), 4); has_ip = 1; }
-        if (rta->rta_type == NDA_LLADDR && RTA_PAYLOAD(rta) == 6)
-        { memcpy(mac, RTA_DATA(rta), 6); has_mac = 1; }
+        if (rta->rta_type == NDA_DST &&
+            RTA_PAYLOAD(rta) == 4)
+        {
+            memcpy(&ip, RTA_DATA(rta), 4);
+            has_ip = 1;
+        }
+
+        if (rta->rta_type == NDA_LLADDR &&
+            RTA_PAYLOAD(rta) == 6)
+        {
+            memcpy(mac, RTA_DATA(rta), 6);
+            has_mac = 1;
+        }
     }
 
     if (has_ip && has_mac)
@@ -260,25 +278,163 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
         neigh_update(ip, mac);
 
         char ip_str[INET_ADDRSTRLEN];
-        struct in_addr a; a.s_addr = ip;
-        inet_ntop(AF_INET, &a, ip_str, sizeof(ip_str));
-        LOG_D("NETLINK", "ARP: %s → %02x:%02x:%02x:%02x:%02x:%02x",
-              ip_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        struct in_addr a;
+        a.s_addr = ip;
 
-        /* Re-install flows for all active routes whose nexthop
-         * just became ARP-resolved.  Routes previously installed as
-         * output:NORMAL fallback will now get the correct L3 forwarding
-         * actions (dec_ttl + MAC rewrite + port output). */
-        if (ctx) {
-            char nh_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &a, nh_str, sizeof(nh_str));
-            for (int i = 0; i < ctx->route_count; i++) {
-                route_entry_t *r = &ctx->routes[i];
-                if (r->state == ROUTE_STATE_WITHDRAWN) continue;
-                if (strcmp(r->nexthop, nh_str) == 0) {
-                    LOG_I("NETLINK", "ARP resolved for nexthop %s — "
-                          "reinstalling flow for %s", nh_str, r->prefix);
-                    install_route_flow(ctx, r);
+        inet_ntop(AF_INET,
+                  &a,
+                  ip_str,
+                  sizeof(ip_str));
+
+        LOG_D("NETLINK",
+              "ARP: %s → %02x:%02x:%02x:%02x:%02x:%02x",
+              ip_str,
+              mac[0], mac[1], mac[2],
+              mac[3], mac[4], mac[5]);
+
+        /* Dedup: skip flow reinstall if same nexthop was processed
+         * within the last 5 seconds. Kernel sends multiple neighbor
+         * events (NUD_STALE, NUD_REACHABLE) for the same IP in quick
+         * succession, causing duplicate FLOW_MOD ADD messages.
+         */
+#define ARP_DEDUP_MAX 16
+#define ARP_DEDUP_US (5ULL * 1000000ULL)
+
+        {
+            static struct
+            {
+                uint32_t ip;
+                uint8_t mac[6];
+                uint64_t last_us;
+            } arp_seen[ARP_DEDUP_MAX];
+
+            static int arp_seen_count = 0;
+
+            uint64_t now_us = a2a_now_us();
+            int skip = 0;
+
+            for (int di = 0;
+                 di < arp_seen_count;
+                 di++)
+            {
+                if (arp_seen[di].ip == ip &&
+                    memcmp(arp_seen[di].mac,
+                           mac,
+                           6) == 0 &&
+                    (now_us -
+                     arp_seen[di].last_us)
+                        < ARP_DEDUP_US)
+                {
+                    skip = 1;
+                    break;
+                }
+
+                /* Update last_us if same IP/MAC but stale */
+                if (arp_seen[di].ip == ip &&
+                    memcmp(arp_seen[di].mac,
+                           mac,
+                           6) == 0)
+                {
+                    arp_seen[di].last_us =
+                        now_us;
+                }
+            }
+
+            if (!skip)
+            {
+                /* Add or update entry */
+                int found_slot = -1;
+
+                for (int di = 0;
+                     di < arp_seen_count;
+                     di++)
+                {
+                    if (arp_seen[di].ip == ip)
+                    {
+                        found_slot = di;
+                        break;
+                    }
+                }
+
+                if (found_slot < 0 &&
+                    arp_seen_count <
+                        ARP_DEDUP_MAX)
+                {
+                    found_slot =
+                        arp_seen_count++;
+                }
+
+                if (found_slot >= 0)
+                {
+                    arp_seen[found_slot].ip =
+                        ip;
+
+                    memcpy(
+                        arp_seen[found_slot].mac,
+                        mac,
+                        6);
+
+                    arp_seen[found_slot]
+                        .last_us = now_us;
+                }
+            }
+
+            if (skip)
+            {
+                LOG_D("NETLINK",
+                      "ARP dedup: "
+                      "skipping reinstall "
+                      "for %s "
+                      "(seen recently)",
+                      ip_str);
+
+                /* Note: neigh_update already
+                 * updated the cache above
+                 */
+            }
+            else if (ctx)
+            {
+                /* Re-install flows for all active routes
+                 * whose nexthop just became ARP-resolved.
+                 * Routes previously installed as
+                 * output:NORMAL fallback will now get
+                 * the correct L3 forwarding actions
+                 * (dec_ttl + MAC rewrite + port output).
+                 */
+                char nh_str[INET_ADDRSTRLEN];
+
+                inet_ntop(AF_INET,
+                          &a,
+                          nh_str,
+                          sizeof(nh_str));
+
+                for (int i = 0;
+                     i < ctx->route_count;
+                     i++)
+                {
+                    route_entry_t *r =
+                        &ctx->routes[i];
+
+                    if (r->state ==
+                        ROUTE_STATE_WITHDRAWN)
+                    {
+                        continue;
+                    }
+
+                    if (strcmp(r->nexthop,
+                               nh_str) == 0)
+                    {
+                        LOG_I("NETLINK",
+                              "ARP resolved "
+                              "for nexthop %s — "
+                              "reinstalling "
+                              "flow for %s",
+                              nh_str,
+                              r->prefix);
+
+                        install_route_flow(ctx,
+                                           r);
+                    }
                 }
             }
         }
@@ -474,23 +630,11 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                 else if (r.metric < ex->metric) {
 
                     withdraw_route_flow(ctx, ex);
-
-                    strncpy(ex->nexthop,
-                            r.nexthop,
-                            sizeof(ex->nexthop) - 1);
-
-                    ex->nexthop[
-                        sizeof(ex->nexthop) - 1] = '\0';
-
-                    strncpy(ex->egress_ifname,
-                            ifname,
-                            sizeof(ex->egress_ifname) - 1);
-
-                    ex->egress_ifname[
-                        sizeof(ex->egress_ifname) - 1] = '\0';
-
+                    strncpy(ex->nexthop, r.nexthop, sizeof(ex->nexthop) - 1);
+                    ex->nexthop[sizeof(ex->nexthop) - 1] = '\0';
+                    strncpy(ex->egress_ifname, ifname, sizeof(ex->egress_ifname) - 1);
+                    ex->egress_ifname[sizeof(ex->egress_ifname) - 1] = '\0';
                     ex->metric = r.metric;
-
                     install_route_flow(ctx, ex);
 
                     LOG_I("NETLINK",
@@ -499,8 +643,18 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                           r.prefix,
                           r.metric);
                 }
+                /* Reinstate previously WITHDRAWN entry if kernel re-adds it */
+                else if (ex->state == ROUTE_STATE_WITHDRAWN) {
+                    ex->state = ROUTE_STATE_ACTIVE;
+                    ex->metric = r.metric;
+                    ex->last_verified_us = a2a_now_us();
+                    install_route_flow(ctx, ex);
+                    LOG_I("NETLINK",
+                          "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
+                          ctx->switch_id, r.prefix, ifname, r.metric);
+                }
 
-                break;
+                break;            
             }
 
             case RTM_DELROUTE:
@@ -568,9 +722,52 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                     ctx->conv_log[oldest_slot].valid = 1;
                 }
 
-                l3_withdraw_route(ctx, r.prefix, "kernel_del");
+                /* Withdraw only the specific prefix+ifname entry that
+                 * the kernel deleted.  l3_withdraw_route() only finds
+                 * the first prefix match; here we need the exact one. */
+                {
+                    const char *del_ifname =
+                        r.ifname[0] ? r.ifname : "kernel";
+                    int withdrew = 0;
+                    for (int wi = 0; wi < ctx->route_count; wi++) {
+                        route_entry_t *wr = &ctx->routes[wi];
+                        if (strcmp(wr->prefix, r.prefix) == 0 &&
+                            strcmp(wr->egress_ifname, del_ifname) == 0 &&
+                            wr->state != ROUTE_STATE_WITHDRAWN) {
+                            wr->state = ROUTE_STATE_WITHDRAWN;
+                            withdraw_route_flow(ctx, wr);
+                            ctx->route_withdrawals++;
+                            LOG_I("L3", "[%s] Route withdrawn: %s dev %s  reason=kernel_del",
+                                  ctx->switch_id, r.prefix, del_ifname);
+                            withdrew = 1;
+                            break;
+                        }
+                    }
+                    if (!withdrew) {
+                        /* Fallback: only call if we could not find the specific
+                         * prefix+ifname entry. This path must NOT fire when the
+                         * entry already exists but is ALREADY WITHDRAWN (that
+                         * means the kernel deleted a secondary route that we
+                         * already cleaned up — safe to ignore). */
+                        int already_gone = 0;
+                        for (int wi = 0; wi < ctx->route_count; wi++) {
+                            route_entry_t *wr = &ctx->routes[wi];
+                            if (strcmp(wr->prefix, r.prefix) == 0 &&
+                                strcmp(wr->egress_ifname, del_ifname) == 0 &&
+                                wr->state == ROUTE_STATE_WITHDRAWN) {
+                                already_gone = 1;
+                                break;
+                            }
+                        }
+                        if (!already_gone) {
+                            l3_withdraw_route(ctx, r.prefix, "kernel_del");
+                        } else {
+                            LOG_D("L3", "[%s] RTM_DELROUTE: %s dev %s already WITHDRAWN — skipping",
+                                  ctx->switch_id, r.prefix, del_ifname);
+                        }
+                    }
 
-                ctx->route_withdrawals++;
+                }
 
                 break;
             }

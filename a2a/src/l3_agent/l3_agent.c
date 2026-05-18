@@ -271,10 +271,14 @@ int l3_withdraw_route(l3_agent_ctx_t *ctx, const char *prefix,
     route_entry_t *r = NULL;
     for (int i = 0; i < ctx->route_count; i++)
     {
-        if (strcmp(ctx->routes[i].prefix, prefix) == 0)
+        if (strcmp(ctx->routes[i].prefix, prefix) == 0 &&
+            ctx->routes[i].state != ROUTE_STATE_WITHDRAWN)
         {
-            r = &ctx->routes[i];
-            break;
+            /* Prefer withdrawn routes to avoid double-withdraw.
+             * If multiple active routes exist for the same prefix,
+             * this withdraws the one most recently verified (least stale). */
+            if (!r || ctx->routes[i].last_verified_us > r->last_verified_us)
+                r = &ctx->routes[i];
         }
     }
     if (!r)
@@ -662,11 +666,35 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     /* STORM_CLEAR bypasses the rate limiter unconditionally.
      * All other anomaly types go through the 2s per-source rate limit. */
     if (pl.anomaly_type == L2_ANOMALY_STORM_CLEAR) {
-        LOG_I("L3", "Decision: STORM_CLEAR → restore");
-        l3_send_policy(ctx, msg->src_agent,
-                       POLICY_RESTORE_PORT,
-                       pl.port, NULL, 0);
-        return;
+    LOG_I("L3", "Decision: STORM_CLEAR → restore");
+    l3_send_policy(ctx, msg->src_agent,
+                   POLICY_RESTORE_PORT,
+                   pl.port, NULL, 0);
+
+    /* Reset DEGRADED routes: storm has cleared, kernel route is still
+     * valid. The degraded state was set because no OVS alternate was
+     * found during the storm — but the route itself is still reachable.
+     * Without this reset, routes stay DEGRADED forever after a storm
+     * that clears without a subsequent link-flap cycle. */
+    {
+        uint64_t now_us = a2a_now_us();
+
+        for (int ri = 0; ri < ctx->route_count; ri++) {
+            route_entry_t *rr = &ctx->routes[ri];
+
+            if (rr->state == ROUTE_STATE_DEGRADED) {
+                rr->state = ROUTE_STATE_ACTIVE;
+                rr->last_verified_us = now_us;
+
+                LOG_I("L3",
+                      "[%s] Storm cleared: route %s restored from DEGRADED to ACTIVE",
+                      ctx->switch_id,
+                      rr->prefix);
+            }
+        }
+    }
+
+    return;
     }
 
     /* Per-source 2s rate limit for all other anomaly types */
@@ -692,9 +720,19 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         }
     }
 
-    if (slot < 0)
-        slot = 0; /* fallback */
-
+    if (slot < 0) {
+        /* Table full — evict oldest entry */
+        uint64_t oldest_us = UINT64_MAX;
+        slot = 0;
+        for (int i = 0; i < L2_ANOMALY_SOURCES_MAX; i++) {
+            if (g_anomaly_rate[i].last_action_us < oldest_us) {
+                oldest_us = g_anomaly_rate[i].last_action_us;
+                slot = i;
+            }
+        }
+        LOG_W("L3", "[%s] anomaly rate table full — evicting %s",
+              ctx->switch_id, g_anomaly_rate[slot].src);
+    }
     strncpy(g_anomaly_rate[slot].src,
             msg->src_agent,
             A2A_MAX_AGENT_ID - 1);
@@ -800,6 +838,17 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
                         LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0, "
                               "removed secondary via %s",
                               ctx->switch_id, subnet, sec_if);
+                        for (int i = 0; i < ctx->route_count; i++) {
+                            if (strcmp(ctx->routes[i].nexthop, "0.0.0.0") != 0 && 
+                                ctx->routes[i].state == ROUTE_STATE_ACTIVE) {
+                                char cmd[256];
+                                snprintf(cmd, sizeof(cmd), 
+                                    "arping -c 2 -I %s %s >/dev/null 2>&1 &",
+                                    ctx->routes[i].egress_ifname,
+                                    ctx->routes[i].nexthop);
+                                system(cmd);
+                            }
+                        }
                     }
                 }
             }
@@ -909,7 +958,17 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                            reg.switch_id,
                            reg.host,
                            reg.port);
-
+        /* When a peer recovers (re-registers), restore any routes
+        * that were degraded due to that peer's failure */
+        for (int ri = 0; ri < ctx->route_count; ri++) {
+            route_entry_t *r = &ctx->routes[ri];
+            if (r->state == ROUTE_STATE_DEGRADED) {
+                r->state = ROUTE_STATE_ACTIVE;
+                r->last_verified_us = a2a_now_us();
+                LOG_I("L3", "[%s] Route %s restored to ACTIVE (peer %s recovered)",
+                      ctx->switch_id, r->prefix, msg->src_agent);
+            }
+        }
         /* ─────────────────────────────────────────────
          * 2. Send REGISTER_ACK
          * ───────────────────────────────────────────── */
@@ -1475,13 +1534,11 @@ l3_agent_ctx_t *l3_agent_create(const char *agent_id,
             // Proactively ARP all transit nexthops so OVS flows get installed
             // immediately rather than waiting for the first packet.
             LOG_I("L3", "[%s] Probing ARP for all kernel nexthops...", ctx->switch_id);
-            system("ip neigh flush all 2>/dev/null; "
-                   "for nh in $(ip route | awk '/via/ {print $3}' | sort -u); do "
+            system("for nh in $(ip route | awk '/via/ {print $3}' | sort -u); do "
                    "    dev=$(ip route get $nh | awk '/dev/ {for(i=1;i<NF;i++) if($i==\"dev\") print $(i+1)}'); "
-                   "    arping -c 2 -I $dev $nh >/dev/null 2>&1 & "
+                   "    [ -n \"$dev\" ] && arping -c 2 -I $dev $nh >/dev/null 2>&1 & "
                    "done");
-            LOG_I("L3", "[%s] Netlink monitor active fd=%d",
-                  switch_id, nl_fd);
+            LOG_I("L3", "[%s] Netlink monitor active fd=%d", switch_id, nl_fd);
         }
         else
         {

@@ -750,7 +750,7 @@ static int build_flow_mod(const ovs_flow_t *flow, uint8_t command,
     {
         p += 7;
         uint32_t port_no;
-        if (!strncmp(p, "normal", 6))
+        if (!strncmp(p, "normal", 6) || !strncmp(p, "NORMAL", 6))
             port_no = OFPP_NORMAL;
         else if (!strncmp(p, "flood", 5))
             port_no = OFPP_FLOOD;

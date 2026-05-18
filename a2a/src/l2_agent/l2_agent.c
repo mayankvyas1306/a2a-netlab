@@ -39,6 +39,20 @@ static const char *l2_get_neighbor_ip(const char *switch_id);
 static const char *l2_get_gateway_ip(const char *switch_id);
 static const char *l2_get_interswitch_port(const char *switch_id);
 
+
+
+static int l2_is_uplink_port(const char *ifname) {
+    size_t n = strlen(ifname);
+    for (size_t i = 1; i + 1 < n; i++) {
+        if (ifname[i] == 'c' &&
+            ifname[i-1] >= '1' && ifname[i-1] <= '9' &&
+            ifname[i+1] >= '1' && ifname[i+1] <= '9') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 {
     l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;
@@ -65,14 +79,14 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
         register_payload_t reg = {0};
         a2a_msg_get_register(msg, &reg);
 
-        /*  Send ACK directly using sender info */
+        /* Send ACK directly using sender info */
         if (conn_pool_send(&agent->pool, reg.host, reg.port, &reply) != 0)
         {
             ctx->agent->send_failures++;
             LOG_W("L2", "Send failed to peer %s", msg->src_agent);
         }
 
-        /*  NOW add peer */
+        /* NOW add peer */
         a2a_agent_add_peer(agent, msg->src_agent,
                            reg.agent_type,
                            reg.switch_id,
@@ -210,26 +224,7 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                 {
                 case POLICY_ISOLATE_PORT:
                 {
-                    /*
-                     * Safety guard: never isolate uplink ports (ports connected to
-                     * core routers). Uplink ports are identified as having an
-                     * interface name matching the switch-to-core naming convention
-                     * (e.g., s1c1, s3c2, etc.) or if only one port leads to the
-                     * data-plane gateway.
-                     * Heuristic: skip if ifname contains 'c' followed by a digit
-                     * (s1c1, s3c2, etc.) as those are core uplinks.
-                     */
-                    int is_uplink = 0;
-                    size_t nl = strlen(ifname);
-                    for (size_t ci = 0; ci < nl - 1; ci++)
-                    {
-                        if (ifname[ci] == 'c' && ifname[ci + 1] >= '1' &&
-                            ifname[ci + 1] <= '9')
-                        {
-                            is_uplink = 1;
-                            break;
-                        }
-                    }
+                    int is_uplink = l2_is_uplink_port(ifname);
                     if (is_uplink)
                     {
                         LOG_W("L2", "[%s] Refusing to isolate uplink port %d (%s) — "
@@ -260,16 +255,28 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                 }
                 case POLICY_RESTORE_PORT:
                 {
+                    /* Re-enable port at OVS level (undoes ISOLATE_PORT admin-down) */
                     ovs_set_port_state(ctx->bridge, ifname, 1);
-                    /* Remove the rate-limit flow that was installed by POLICY_RATE_LIMIT.
-                     * Without this deletion, the priority=1 flow stays permanently and
-                     * the port remains metered even after the storm is gone. */
+                    /* Remove rate-limit flow (priority=1, installed by POLICY_RATE_LIMIT
+                     * or the uplink downgrade path in POLICY_ISOLATE_PORT) */
                     char rl_match[64];
                     snprintf(rl_match, sizeof(rl_match), "in_port=%d", pl.port);
                     ovs_del_flow(ctx->bridge, rl_match);
-                    LOG_I("L2", "Port %d restored (rate-limit flow removed)", pl.port);
+
+                    /* Remove isolation drop flow (priority=500, installed by POLICY_ISOLATE_PORT).
+                     * del_flow with no priority= prefix deletes ALL strict matches for in_port=N,
+                     * but ovs_del_flow uses OFPFC_DELETE (non-strict), which removes all matching
+                     * flows at any priority that share the match. We need strict deletion of the
+                     * priority=500 flow specifically to avoid accidentally deleting learned MAC
+                     * flows that happen to match in_port. Use a priority-qualified match string. */
+                    char drop_match[128];
+                    snprintf(drop_match, sizeof(drop_match),
+                             "priority=500,in_port=%d", pl.port);
+                    ovs_del_flow(ctx->bridge, drop_match);
+
+                    LOG_I("L2", "Port %d restored (rate-limit + isolation flows removed)", pl.port);
                     break;
-                }                
+                }          
                 case POLICY_RATE_LIMIT:
                 {
                     /* Use meter 2 for per-port rate limiting.
@@ -310,11 +317,12 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 
                 case POLICY_FLUSH_PORT:
                 {
-                    ovs_flush_mac(ctx->bridge, NULL);
-                    LOG_W("L2", "Flows flushed on bridge %s", ctx->bridge);
+                    /* Flush only the specific port's learned MAC flows, not the entire bridge.
+                     * Pass ifname so ovs_flush_mac can scope the deletion. */
+                    ovs_flush_mac(ctx->bridge, ifname);
+                    LOG_W("L2", "Flows flushed on port %d (%s)", pl.port, ifname);
                     break;
                 }
-
                 default:
                     break;
                 }
@@ -1089,6 +1097,14 @@ static void l2_ovsdb_epoll_handler(int fd, void *ud)
 {
     l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)ud;
 
+    /* Guard: reset buffer if nearly full to prevent recv(size=0) stall */
+    if (ctx->ovsdb_len >= sizeof(ctx->ovsdb_buf) - 1024) {
+        LOG_E("L2-OVSDB", "[%s] OVSDB buffer overflow (%zu bytes) — resetting",
+              ctx->switch_id, ctx->ovsdb_len);
+        ctx->ovsdb_len = 0;
+        memset(ctx->ovsdb_buf, 0, sizeof(ctx->ovsdb_buf));
+    }
+
     ssize_t n = recv(fd,
                      ctx->ovsdb_buf + ctx->ovsdb_len,
                      sizeof(ctx->ovsdb_buf) - ctx->ovsdb_len - 1,
@@ -1301,9 +1317,9 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
              * generating PACKET_IN events for the L2 agent.
              *
              * The agent then performs:
-             *   1. source MAC learning
-             *   2. MAC-to-port mapping
-             *   3. dynamic dl_dst flow installation
+             * 1. source MAC learning
+             * 2. MAC-to-port mapping
+             * 3. dynamic dl_dst flow installation
              *
              * Learned destination flows are installed later at
              * higher priority (priority=10).
@@ -1373,10 +1389,10 @@ void l2_print_table(l2_agent_ctx_t *ctx)
      * stdout may not appear in runtime logs.
      *
      * LOG_I() ensures:
-     *   - docker logs visibility
-     *   - centralized logging
-     *   - timestamped structured output
-     *   - production-grade observability
+     * - docker logs visibility
+     * - centralized logging
+     * - timestamped structured output
+     * - production-grade observability
      */
 
     LOG_I("L2",
@@ -1495,16 +1511,16 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
      * Inter-switch ports are sNsN. We detect uplinks by 'c' after a digit.
      *
      * When sw1's uplink (s1c1, port 1) goes down:
-     *   Physical alternate: sw1 → s1s2 → sw2 → s2c1 → core1(c1s2 kernel)
+     * Physical alternate: sw1 → s1s2 → sw2 → s2c1 → core1(c1s2 kernel)
      *
      * Two actions needed:
-     *   1. OVS: redirect all existing flows pointing to the dead port
-     *      to the inter-switch port instead. This covers:
-     *      - dl_dst=core1_MAC → was output:1, must become output:5
-     *      - ip,nw_dst=X.X.X.0/24 flows (will be re-matched by NORMAL)
-     *   2. Kernel: redirect default route via neighbor switch IP so that
-     *      sw1's own kernel-originated packets (ARP, etc.) also use the
-     *      alternate path.
+     * 1. OVS: redirect all existing flows pointing to the dead port
+     * to the inter-switch port instead. This covers:
+     * - dl_dst=core1_MAC → was output:1, must become output:5
+     * - ip,nw_dst=X.X.X.0/24 flows (will be re-matched by NORMAL)
+     * 2. Kernel: redirect default route via neighbor switch IP so that
+     * sw1's own kernel-originated packets (ARP, etc.) also use the
+     * alternate path.
      */
     int is_uplink = 0;
     const char *uplink_ifname = NULL;
@@ -1514,18 +1530,7 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
         if (ctx->ports[i].port_no != port)
             continue;
         uplink_ifname = ctx->ports[i].ifname;
-        /* Uplink: pattern is sNcN — has 'c' after a digit */
-        size_t nl = strlen(uplink_ifname);
-        for (size_t ci = 1; ci < nl; ci++)
-        {
-            if (uplink_ifname[ci] == 'c' &&
-                uplink_ifname[ci-1] >= '1' &&
-                uplink_ifname[ci-1] <= '9')
-            {
-                is_uplink = 1;
-                break;
-            }
-        }
+        is_uplink = l2_is_uplink_port(uplink_ifname);
         break;
     }
 
@@ -1555,21 +1560,21 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
              * Failover strategy — OVS NORMAL handles rerouting:
              *
              * 1. Flush learned MAC flows. After flush, all unknown-dst
-             *    packets hit table-miss → CONTROLLER → PACKET_IN.
-             *    The agent replies with PACKET_OUT(NORMAL). OVS NORMAL
-             *    floods to all UP ports — since s1c1 is DOWN, OVS
-             *    automatically excludes it from the flood set.
-             *    Packets reach core1 via s1s2→sw2→s2c1→c1s2.
+             * packets hit table-miss → CONTROLLER → PACKET_IN.
+             * The agent replies with PACKET_OUT(NORMAL). OVS NORMAL
+             * floods to all UP ports — since s1c1 is DOWN, OVS
+             * automatically excludes it from the flood set.
+             * Packets reach core1 via s1s2→sw2→s2c1→c1s2.
              *
              * 2. Do NOT install catch-all IP/ARP redirect flows.
-             *    priority=8 ip and priority=15 arp would override
-             *    table-miss for ALL traffic including local same-switch
-             *    packets (host1→host3), breaking intra-switch connectivity.
-             *    OVS standalone fail_mode already handles dead port
-             *    exclusion during NORMAL flooding.
+             * priority=8 ip and priority=15 arp would override
+             * table-miss for ALL traffic including local same-switch
+             * packets (host1→host3), breaking intra-switch connectivity.
+             * OVS standalone fail_mode already handles dead port
+             * exclusion during NORMAL flooding.
              *
              * 3. Change kernel route so sw1's own kernel-originated
-             *    packets (OSPF, management) use the alternate next-hop.
+             * packets (OSPF, management) use the alternate next-hop.
              */
 
             /* Step 1: Flush learned MAC flows — forces re-learning */
