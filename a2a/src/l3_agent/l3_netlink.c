@@ -1,15 +1,9 @@
 /*
- * l3_netlink.c — Real-time Linux routing monitor via RTNETLINK
+ * Real-time Linux routing monitor via RTNETLINK
  *
- * Subscribes to:
- *   RTMGRP_IPV4_ROUTE → RTM_NEWROUTE, RTM_DELROUTE
- *   RTMGRP_LINK       → RTM_NEWLINK,  RTM_DELLINK
- *   RTMGRP_IPV4_IFADDR → interface address changes
- *   RTMGRP_NEIGH      → ARP/neighbor table (next-hop MAC resolution)
- *
- * Dumps the initial route table on startup via RTM_GETROUTE.
- * The fd is returned and must be added to the agent's epoll loop.
- * l3_netlink_process() is called when epoll signals the fd readable.
+ * Subscribes to RTMGRP_IPV4_ROUTE, RTMGRP_LINK, RTMGRP_IPV4_IFADDR,
+ * and RTMGRP_NEIGH. Dumps initial routes on startup. The fd is added
+ * to the agent's epoll loop; l3_netlink_process() handles readability.
  */
 
 #define _GNU_SOURCE
@@ -71,8 +65,8 @@ static void neigh_update(uint32_t ip, const uint8_t *mac)
 }
 
 /*
- * Resolve a next-hop IP to its MAC address from the ARP cache.
- * Returns 0 on success (mac_out filled), -1 if not found.
+ * Resolve next-hop IP to MAC from ARP cache.
+ * Returns 0 on success, -1 if not found.
  */
 int l3_arp_resolve(const char *nexthop_ip, char *mac_out, int mac_out_sz)
 {
@@ -293,10 +287,7 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
               mac[3], mac[4], mac[5]);
 
         /* Dedup: skip flow reinstall if same nexthop was processed
-         * within the last 5 seconds. Kernel sends multiple neighbor
-         * events (NUD_STALE, NUD_REACHABLE) for the same IP in quick
-         * succession, causing duplicate FLOW_MOD ADD messages.
-         */
+         * within the last 5s (kernel sends rapid NUD transitions). */
 #define ARP_DEDUP_MAX 16
 #define ARP_DEDUP_US (5ULL * 1000000ULL)
 
@@ -394,13 +385,9 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
             }
             else if (ctx)
             {
-                /* Re-install flows for all active routes
-                 * whose nexthop just became ARP-resolved.
-                 * Routes previously installed as
-                 * output:NORMAL fallback will now get
-                 * the correct L3 forwarding actions
-                 * (dec_ttl + MAC rewrite + port output).
-                 */
+                /* Reinstall flows for routes whose nexthop just got ARP-resolved.
+                 * Routes previously using output:NORMAL fallback get proper
+                 * L3 forwarding (dec_ttl + MAC rewrite + port output). */
                 char nh_str[INET_ADDRSTRLEN];
 
                 inet_ntop(AF_INET,
@@ -722,9 +709,8 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                     ctx->conv_log[oldest_slot].valid = 1;
                 }
 
-                /* Withdraw only the specific prefix+ifname entry that
-                 * the kernel deleted.  l3_withdraw_route() only finds
-                 * the first prefix match; here we need the exact one. */
+                /* Withdraw only the exact prefix+ifname entry the kernel deleted.
+                 * l3_withdraw_route() finds only the first prefix match. */
                 {
                     const char *del_ifname =
                         r.ifname[0] ? r.ifname : "kernel";
@@ -744,11 +730,8 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                         }
                     }
                     if (!withdrew) {
-                        /* Fallback: only call if we could not find the specific
-                         * prefix+ifname entry. This path must NOT fire when the
-                         * entry already exists but is ALREADY WITHDRAWN (that
-                         * means the kernel deleted a secondary route that we
-                         * already cleaned up — safe to ignore). */
+                        /* Fallback: only call if specific prefix+ifname not found.
+                         * Skip if entry exists but is already WITHDRAWN. */
                         int already_gone = 0;
                         for (int wi = 0; wi < ctx->route_count; wi++) {
                             route_entry_t *wr = &ctx->routes[wi];

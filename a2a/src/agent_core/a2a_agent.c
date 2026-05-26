@@ -67,10 +67,9 @@ a2a_agent_t *a2a_agent_create(const char *agent_id, agent_type_t type,
 
     
 
-    /* NOTE: main.c calls fsm_process(START) directly after agent_create.
-     * Do NOT push START into the queue here — that would cause a second
-     * START to fire when the queue drains, hitting an unregistered
-     * (DISCOVERY + START) → ERROR cell and corrupting the FSM silently. */
+    /* main.c calls fsm_process(START) directly after create.
+     * Do NOT enqueue START here — a duplicate would hit an unregistered
+     * (DISCOVERY + START) cell and corrupt the FSM. */
 
     return agent;
 }
@@ -99,27 +98,9 @@ int a2a_agent_register_handler(a2a_agent_t *agent,
 void a2a_agent_compact_peers(a2a_agent_t *agent)
 {
     /*
-     * Production-grade peer eviction.
-     *
-     * Dead peers are NOT immediately removed.
-     *
-     * Instead:
-     *   alive=0
-     *   tombstone_us=timestamp
-     *
-     * The peer remains in the table for 60 seconds,
-     * allowing:
-     *   - peer restart
-     *   - TCP reconnect
-     *   - REGISTER replay
-     *   - heartbeat recovery
-     *   - distributed stabilization
-     *
-     * Without this grace period:
-     *   - peer flapping occurs
-     *   - duplicate peers appear
-     *   - recovery becomes unstable
-     *   - distributed coordination breaks
+     * Grace-period eviction: dead peers stay in the table for 60s
+     * to allow recovery via restart, reconnect, or heartbeat.
+     * Without this, peer flapping and duplicate entries occur.
      */
 
     uint64_t now = a2a_now_us();
@@ -130,12 +111,7 @@ void a2a_agent_compact_peers(a2a_agent_t *agent)
     {
         agent_peer_t *p = &agent->peers[i];
 
-        /*
-         * Evict only if:
-         *   peer is dead
-         *   tombstone exists
-         *   grace period expired
-         */
+        /* Evict if dead, tombstoned, and grace period (60s) expired */
         if (!p->alive &&
             p->tombstone_us > 0 &&
             (now - p->tombstone_us) > 60ULL * 1000000ULL)
@@ -147,10 +123,7 @@ void a2a_agent_compact_peers(a2a_agent_t *agent)
                   p->agent_id,
                   (double)(now - p->tombstone_us) / 1e6);
 
-            /*
-             * Compact array by replacing current slot
-             * with last peer.
-             */
+            /* Compact: swap with last entry */
             agent->peers[i] =
                 agent->peers[--agent->peer_count];
         }
@@ -184,12 +157,7 @@ int a2a_agent_add_peer(a2a_agent_t *agent, const char *peer_id,
             ex->port = port;
             if (!ex->alive)
             {
-                /*
-                * Peer recovered during tombstone grace period.
-                *
-                * Restore liveness without creating duplicate
-                * peer-table entries.
-                */
+                /* Peer recovered during tombstone grace period */
                 ex->alive = 1;
 
                 ex->last_heartbeat_us =
@@ -197,9 +165,6 @@ int a2a_agent_add_peer(a2a_agent_t *agent, const char *peer_id,
 
                 ex->last_send_attempt_us = 0;
 
-                /*
-                 * Clear tombstone because peer recovered.
-                 */
                 ex->tombstone_us = 0;
 
                 LOG_I("AGENT",

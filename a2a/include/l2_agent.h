@@ -8,11 +8,7 @@
 #define L2_MAX_MAC_TABLE 256
 #define L2_MAX_PORTS 48
 #define MAC_AGE_US (300ULL * 1000000ULL) /* 5 min */
-/*
- * Storm threshold: 1000 pps is production-grade.
- * For lab testing with iperf/flood tools, lower to 100 pps.
- * Set via compile flag -DL2_STORM_THRESHOLD_PPS=100 or keep default.
- */
+/* Storm threshold: 1000 pps for production; override with -DL2_STORM_THRESHOLD_PPS=N */
 #ifndef STORM_THRESHOLD_PPS
 #define STORM_THRESHOLD_PPS 1000         /* pkts/s per port */
 #endif
@@ -48,6 +44,13 @@ typedef struct
     uint32_t bcast_drop_pps;   /* broadcast drops per second */
 } port_state_t;
 
+/* Topology info learned from L3 via MSG_TOPOLOGY messages */
+typedef struct {
+    char prefix[48];       /* "10.0.0.0/24" */
+    char nexthop[48];      /* gateway IP "10.0.0.254" */
+    char neighbor_ip[48];  /* secondary switch IP */
+} l2_topo_info_t;
+
 typedef struct
 {
     a2a_agent_t *agent;
@@ -69,14 +72,11 @@ typedef struct
     uint32_t flows_installed;
     uint32_t l3_notifies_sent;
 
-    /*
-     * OVSDB receive buffer.
-     * The initial monitor response for a full OVS table can be
-     * several hundred KB.  262144 (256 KB) is safe for up to ~128
-     * interfaces with full statistics.
-     */
+    /* OVSDB receive buffer — 256KB covers ~128 interfaces with full statistics */
     char ovsdb_buf[262144];
     size_t ovsdb_len;
+    l2_topo_info_t topo;    
+    char gateway_ip[48];
 } l2_agent_ctx_t;
 
 /* Lifecycle */

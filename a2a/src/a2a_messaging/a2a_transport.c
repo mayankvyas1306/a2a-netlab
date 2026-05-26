@@ -184,9 +184,7 @@ a2a_server_t *a2a_server_create(const char *agent_id,
 
     srv->epoll_fd = epoll_create1(0);
 
-    /* Allocate dynamic OVSDB receive buffer (256 KB).
-     * The initial monitor response for large OVS tables can exceed
-     * 64 KB easily.  A fixed 8 KB buffer causes silent data loss. */
+    /* Dynamic OVSDB buffer — 256KB; initial monitor responses can exceed 64KB */
 #define OVSDB_BUF_INIT_CAP (256 * 1024)
     srv->ovsdb_buf = malloc(OVSDB_BUF_INIT_CAP);
     if (!srv->ovsdb_buf)
@@ -226,7 +224,7 @@ int a2a_server_poll(a2a_server_t *srv, int timeout_ms)
     {
         int fd = events[i].data.fd;
 
-        /* Unknown fd — may be external (OpenFlow, Netlink, etc.) */
+        /* External fd (OpenFlow, Netlink) — dispatch to registered handler */
         if (fd != srv->listen_fd && !fd_buf_get(fd))
         {
             int handled = 0;
@@ -364,12 +362,7 @@ int a2a_server_poll(a2a_server_t *srv, int timeout_ms)
     return n;
 }
 
-/* ───────── ADD EXTERNAL FD TO EPOLL ───────── */
-/*
- * Allow other modules (e.g., Netlink monitor) to register their fds
- * with the server's epoll instance so they are driven by the same
- * a2a_server_poll() call.
- */
+/* Register external fds (Netlink, OpenFlow) with the server's epoll. */
 int a2a_server_add_fd(a2a_server_t *srv, int fd)
 {
     if (!srv || fd < 0)
@@ -399,10 +392,7 @@ void a2a_server_destroy(a2a_server_t *srv)
     if (!srv)
         return;
 
-    /*
-     * Null out callbacks first so any in-flight epoll event that
-     * fires between now and close() cannot call into freed memory.
-     */
+    /* Null callbacks first to prevent use-after-free from in-flight events */
     srv->handler = NULL;
     srv->userdata = NULL;
 

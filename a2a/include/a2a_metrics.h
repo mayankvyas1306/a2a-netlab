@@ -1,10 +1,7 @@
 #ifndef A2A_METRICS_H
 #define A2A_METRICS_H
 
-/*
- * Performance metrics collection for A2A agents.
- * Metrics are computed on demand and exported as JSON.
- */
+/* A2A agent performance metrics — computed on demand, exported as JSON. */
 
 #include <stdint.h>
 #include "a2a_agent.h"
@@ -37,16 +34,12 @@ typedef struct a2a_metrics_t {
 
 } a2a_metrics_t;
 
-/* Initialize metrics structure */
 void metrics_init(a2a_metrics_t *m);
 
-/* Record one latency sample */
 void metrics_record_latency(a2a_metrics_t *m, uint64_t sent_us);
 
-/* Refresh throughput and resource metrics */
 void metrics_update(a2a_metrics_t *m, const a2a_agent_t *agent);
 
-/* Dump metrics as JSON */
 void metrics_dump(const a2a_metrics_t *m,
                   const a2a_agent_t   *agent,
                   const l2_agent_ctx_t *l2,   /* NULL for L3 */

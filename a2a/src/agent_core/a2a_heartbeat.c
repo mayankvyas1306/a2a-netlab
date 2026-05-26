@@ -1,24 +1,9 @@
 /*
  * a2a_heartbeat.c — Peer liveness via periodic heartbeat
  *
- * Design principles (fixed):
- *
- * 1. SEND TO ALL KNOWN PEERS regardless of alive flag.
- *    The alive flag is a liveness INDICATOR, not a send gate.
- *    If a peer is temporarily unreachable, we still attempt to send
- *    so we notice when it comes back (conn_pool_send will reconnect).
- *
- * 2. PEER STATE is three-valued: alive=1 (healthy), alive=0 (timed out).
- *    Recovery: heartbeat_on_received() sets alive=1 unconditionally,
- *    which allows a timed-out peer to self-heal when it reconnects.
- *
- * 3. TIMEOUT fires ONE event per peer per timeout period. A retry
- *    counter prevents event spam when a peer stays dead.
- *
- * 4. last_heartbeat_us is initialised to NOW at peer-add time.
- *    The 15-second window begins from first registration, not from
- *    the first heartbeat exchange — this gives ~4 heartbeat cycles
- *    (at 3s interval) before a peer is considered timed out.
+ * Heartbeats are sent to ALL peers (alive or dead) so recovery is detected.
+ * Timeout fires one event per peer per epoch. Dead peers remain in the
+ * table for a grace period (see a2a_agent_compact_peers).
  */
 
 #include "a2a_heartbeat.h"
@@ -33,17 +18,9 @@
 #define PEER_TIMEOUT_US (15ULL * 1000000ULL)
 #define PEER_DEAD_RETRY_US (30ULL * 1000000ULL) /* retry reconnect every 30s */
 
-/* ── Send ────────────────────────────────────────────────────────────
- *
- * Send heartbeat to ALL known peers — alive or dead.
- *
- * WHY: if we skip dead peers we never learn they came back.
- *      conn_pool_send already has a 3-attempt reconnect loop;
- *      a failed send just increments send_failures and returns -1.
- *      We ignore that failure here — the timeout checker decides
- *      the liveness verdict based on received heartbeats, not on
- *      whether our outbound send succeeded.
- */
+/* Send heartbeat to ALL known peers (alive or dead).
+ * Dead peers are probed at PEER_DEAD_RETRY_US intervals;
+ * liveness is determined by received heartbeats, not send success. */
 void heartbeat_send_all(a2a_agent_t *agent)
 {
     static unsigned hb_tick = 0;
@@ -66,15 +43,7 @@ void heartbeat_send_all(a2a_agent_t *agent)
     {
         agent_peer_t *p = &agent->peers[i];
 
-        /*
-         * Skip peers that are dead AND were last-attempted recently.
-         * This throttles reconnect probes to once per PEER_DEAD_RETRY_US
-         * so we don't hammer a truly-gone peer with 0.3s retry storms.
-         *
-         * alive == 1: always send (normal operation).
-         * alive == 0: send only if PEER_DEAD_RETRY_US has elapsed since
-         *             last outbound attempt (stored in last_send_attempt_us).
-         */
+        /* Throttle dead-peer probes to PEER_DEAD_RETRY_US intervals */
         if (!p->alive)
         {
             /* Skip peers with no send address (pre-inserted or corrupted) */
@@ -117,20 +86,8 @@ void heartbeat_send_all(a2a_agent_t *agent)
     }
 }
 
-/* ── Check ───────────────────────────────────────────────────────────
- *
- * Mark peers timed-out based on when we LAST RECEIVED a heartbeat
- * from them — not on whether our send succeeded.
- *
- * Key fixes vs. original:
- *   - Only fires PEER_TIMEOUT event once per timeout epoch
- *     (guarded by timeout_fired flag in agent_peer_t).
- *   - Does NOT compact the peer table here — compaction must happen
- *     outside the iteration loop to avoid index corruption.
- *   - Peers that come back alive (heartbeat_on_received sets alive=1)
- *     get their timeout_fired flag cleared so the next timeout fires
- *     another event if needed.
- */
+/* Check peer liveness based on last received heartbeat.
+ * Timeout fires once per epoch; compaction happens elsewhere. */
 void heartbeat_check_peers(a2a_agent_t *agent)
 {
     uint64_t now = a2a_now_us();
@@ -138,8 +95,6 @@ void heartbeat_check_peers(a2a_agent_t *agent)
     for (int i = 0; i < agent->peer_count; i++)
     {
         agent_peer_t *p = &agent->peers[i];
-
-       
 
         /* Peer that has never exchanged a heartbeat yet — grace period */
         if (p->last_heartbeat_us == 0)
@@ -163,30 +118,7 @@ void heartbeat_check_peers(a2a_agent_t *agent)
 
         if (p->alive && age > PEER_TIMEOUT_US)
         {
-            /*
-             * Transition:
-             *   healthy → timed-out
-             *
-             * Do NOT immediately evict the peer.
-             * Instead:
-             *   - mark alive=0
-             *   - stamp tombstone_us
-             *
-             * This enables:
-             *   - graceful recovery
-             *   - peer restart handling
-             *   - reconnect stabilization
-             *   - distributed self-healing
-             */
-
             p->alive = 0;
-
-            /*
-             * Start tombstone grace-period timer.
-             *
-             * Peer compaction/eviction will happen later
-             * only after the grace window expires.
-             */
             p->tombstone_us = a2a_now_us();
 
             LOG_W("HB",
@@ -209,20 +141,12 @@ void heartbeat_check_peers(a2a_agent_t *agent)
 
             event_queue_push(&agent->eq, &ev);
         }
-        /* else: alive and within timeout — or dead and waiting for recovery */
     }
 }
 
-/* ── Receive ─────────────────────────────────────────────────────────
- *
- * A heartbeat arrived from src_agent.  Update the liveness timestamp
- * and mark alive=1 unconditionally.  This is the self-healing path:
- * if a peer timed out but then reconnects, the first received heartbeat
- * clears the dead state without requiring a full re-registration.
- *
- * NOTE: if the peer is not in the table yet (race during startup),
- * we silently ignore — the REGISTER handshake will add it shortly.
- */
+/* Heartbeat received — unconditionally restore liveness.
+ * Self-healing: a timed-out peer recovers on first received heartbeat
+ * without requiring re-registration. */
 void heartbeat_on_received(a2a_agent_t *agent, const a2a_message_t *msg)
 {
     uint64_t now = a2a_now_us();
@@ -237,23 +161,9 @@ void heartbeat_on_received(a2a_agent_t *agent, const a2a_message_t *msg)
 
         if (!p->alive)
         {
-            /*
-             * Self-healing recovery path.
-             *
-             * Peer heartbeat resumed before tombstone
-             * eviction window expired.
-             */
-
+            /* Self-healing: peer recovered before tombstone eviction */
             p->alive = 1;
-
-            /*
-             * Clear tombstone because peer recovered.
-             */
             p->tombstone_us = 0;
-
-            /*
-             * Reset reconnect probe throttling.
-             */
             p->last_send_attempt_us = 0;
 
             LOG_I("HB",
@@ -263,9 +173,7 @@ void heartbeat_on_received(a2a_agent_t *agent, const a2a_message_t *msg)
         }
         return;
     }
-    /* Unknown sender — peer not yet in table (startup race or
-     * reconnect before re-registration).  Log at WARN so it
-     * is visible; the REGISTER handshake will add it shortly. */
+    /* Unknown sender — startup race; REGISTER handshake will add it */
     LOG_D("HB", "[%s] heartbeat from UNKNOWN peer %s — ignoring (startup race)",
       agent->card.agent_id, msg->src_agent);
 }

@@ -1,17 +1,9 @@
 /*
- * ovs_openflow.c — Native OpenFlow 1.3 integration
+ * Native OpenFlow 1.3 integration
  *
- * Connects to /var/run/openvswitch/<bridge>.mgmt
- * Implements:
- *   - HELLO handshake
- *   - FEATURES_REQUEST
- *   - FLOW_MOD (ADD / DELETE) with OXM match + action encoding
- *   - PACKET_IN handling for real MAC learning
- *   - Table-miss entry installation
- *   - ECHO_REQUEST reply (controller liveness)
- *   - METER_MOD (ADD) for rate limiting
- *
- * No popen(), no system(), no ovs-ofctl subprocess.
+ * Connects to /var/run/openvswitch/<bridge>.mgmt. Implements HELLO,
+ * FEATURES_REQUEST, FLOW_MOD, PACKET_IN (MAC learning), ECHO_REQUEST,
+ * and METER_MOD. No subprocess calls.
  */
 
 #define _GNU_SOURCE
@@ -828,13 +820,8 @@ static int of_reconnect(const char *bridge)
 /* ── Meter management ────────────────────────────────────────────── */
 
 /*
- * ovs_of_add_meter — Install an OpenFlow 1.3 METER_MOD ADD.
- * Creates a DROP meter that discards packets exceeding rate_kbps.
- * Called before installing a "meter:N,output:normal" flow.
- *
- * Wire format:
- *   ofp_header(8) + command(2) + flags(2) + meter_id(4)
- *   + band: type(2)+len(2)+rate(4)+burst(4)+pad(4) = 16 bytes
+ * Install an OpenFlow 1.3 DROP meter at rate_kbps.
+ * Must be called before installing a "meter:N,output:normal" flow.
  */
 int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
                      uint32_t rate_kbps)
@@ -930,11 +917,7 @@ int ovs_of_add_flow(const char *bridge, const ovs_flow_t *flow)
     return 0;
 }
 
-/*
- * ovs_of_del_flow_at_priority — DELETE_STRICT for a specific priority.
- * Use this instead of ovs_of_del_flow when you know the exact priority
- * to avoid accidentally deleting flows at other priorities.
- */
+/* DELETE_STRICT at a specific priority to avoid collateral deletion. */
 int ovs_of_del_flow_at_priority(const char *bridge, const char *match,
                                 uint16_t priority)
 {
@@ -998,24 +981,12 @@ int ovs_of_list_flows(const char *bridge, ovs_flow_t *out, int max)
 }
 
 /*
- * ovs_of_flush_mac — Delete all learned MAC forwarding flows (priority=10).
+ * Flush all learned MAC flows by DELETE non-strict (empty OXM),
+ * then immediately reinstall permanent protection flows.
  *
- * Strategy: install all learned MAC flows with cookie=0xA2A00000A2A00000.
- * Flush using DELETE non-strict with cookie+mask. This is the only reliable
- * way to delete a specific subset of flows in OpenFlow 1.3 without affecting
- * other priority levels.
- *
- * Since we cannot retroactively cookie existing flows, we use a two-step
- * approach:
- *   1. DELETE non-strict, empty OXM, cookie=0/mask=0 — this deletes ALL
- *      flows in the table. Then immediately reinstall the permanent
- *      protection flows (priority=50 bcast, priority=45 mcast, priority=0
- *      table-miss). This is safe because these flows are reinstalled
- *      atomically before any new traffic arrives.
- *
- * This approach is chosen over STRICT+empty-match because OF1.3 DELETE
- * STRICT with empty OXM only matches flows that were installed with an
- * empty OXM match — it does NOT wildcard across all installed flows.
+ * DELETE non-strict with empty OXM wildcards all flows. We must
+ * reinstall table-miss, broadcast, and multicast protection flows
+ * atomically before any new traffic arrives.
  */
 int ovs_of_flush_mac(const char *bridge)
 {
@@ -1023,18 +994,7 @@ int ovs_of_flush_mac(const char *bridge)
     if (!c)
         return -1;
 
-    /*
-     * Step 1: DELETE non-strict with out_port=OFPP_ANY, empty OXM.
-     * This deletes ALL flows in table 0. We will reinstall permanent
-     * flows immediately after.
-     *
-     * Why not filter by priority=10? OF1.3 DELETE non-strict does NOT
-     * filter by priority — it matches any flow whose OXM is a superset
-     * of the specified OXM. With empty OXM, all flows match.
-     *
-     * IMPORTANT: We exclude priority=0 (table-miss) by NOT deleting it
-     * separately — instead we reinstall it immediately below.
-     */
+    /* Step 1: DELETE non-strict with empty OXM — removes ALL flows in table 0 */
     uint8_t buf[128];
     memset(buf, 0, sizeof(buf));
 
@@ -1077,15 +1037,7 @@ int ovs_of_flush_mac(const char *bridge)
     g_mac_count = 0;
     memset(g_mac_table, 0, sizeof(g_mac_table));
 
-    /*
-     * Step 2: Reinstall permanent flows that must always be present.
-     * These are wiped by the DELETE above and MUST be reinstalled
-     * before returning, because the first packet after flush must
-     * hit table-miss → CONTROLLER or the broadcast/mcast protection.
-     *
-     * Reinstall in priority order: table-miss first (lowest), then
-     * protection flows (higher priority, installed after).
-     */
+    /* Step 2: Reinstall permanent flows wiped by DELETE above */
 
     /* Table-miss: priority=0, actions=CONTROLLER */
     int of_install_table_miss(int fd, const char *bridge);
@@ -1193,10 +1145,7 @@ static void mac_table_learn(const uint8_t *eth_src, uint32_t in_port,
     ovs_of_add_flow(bridge, &fwd);
 }
 
-/*
- * PACKET_OUT flood uses dynamically allocated buffer to avoid
- * the 2048-byte stack overflow when pkt_len is large.
- */
+/* PACKET_OUT flood — dynamically allocated to avoid stack overflow. */
 static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
                                      uint32_t in_port,
                                      const uint8_t *pkt_data, int pkt_len)
@@ -1257,13 +1206,7 @@ static void of_send_packet_out_flood(int fd, uint32_t buffer_id,
     send(fd, buf, off, MSG_NOSIGNAL);
     free(buf);
 }
-/*
- * ovs_of_process_packet_in — drain all readable OF messages from fd.
- * Handles: ECHO_REQUEST (reply immediately), PACKET_IN (MAC learn + flood).
- *
- * ECHO_REQUEST is now handled so OVS doesn't consider the
- * controller dead and sweep its flows.
- */
+/* Drain all readable OF messages: handle ECHO_REQUEST and PACKET_IN. */
 void ovs_of_process_packet_in(const char *bridge, int fd)
 {
     for (;;)

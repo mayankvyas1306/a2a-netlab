@@ -1,7 +1,3 @@
-/*
- * Performance metrics implementation.
- */
-
 #define _GNU_SOURCE
 
 #include "a2a_metrics.h"
@@ -17,7 +13,6 @@ void metrics_init(a2a_metrics_t *m)
 {
     memset(m, 0, sizeof(*m));
 
-    /* Initialize minimum latency tracker */
     m->latency_min_us = UINT64_MAX;
 
     m->last_sample_us = a2a_now_us();
@@ -28,13 +23,12 @@ void metrics_record_latency(a2a_metrics_t *m, uint64_t sent_us)
 {
     uint64_t now = a2a_now_us();
 
-    /* Ignore invalid timestamps */
     if (sent_us == 0 || sent_us > now)
         return;
 
     uint64_t lat = now - sent_us;
 
-    /* Ignore unrealistic latency values */
+    /* Reject outliers > 60s */
     if (lat > 60ULL * 1000000ULL) {
 
         LOG_D("METRICS",
@@ -152,7 +146,6 @@ void metrics_update(a2a_metrics_t *m,
             (double)delta / 100.0 /
             cpu_elapsed_s * 100.0;
 
-        /* Clamp CPU percentage */
         if (m->cpu_pct > 100.0)
             m->cpu_pct = 100.0;
     }
@@ -177,7 +170,6 @@ void metrics_dump(const a2a_metrics_t *m,
         (double)(a2a_now_us() -
                  agent->start_time_us) / 1e6;
 
-    /* Print metrics as JSON */
     fprintf(stderr,
             "{\"metrics\":{"
             "\"agent\":\"%s\","

@@ -1,9 +1,4 @@
-/*
- * main.c — A2A Agent entry point
- *
- * Production-grade: all events driven by real OVS/Netlink data.
- * No hardcoded scenarios, no --scenario flags, no mock triggers.
- */
+/* A2A Agent entry point (event-driven via OVS/Netlink, no mock triggers). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,11 +152,7 @@ int main(int argc, char *argv[])
         }
         agent = l3->agent;
 
-        /*
-         * In real mode the Netlink dump will populate routes from the
-         * kernel.  In mock mode we seed a local route so the agent
-         * has something to advertise.
-         */
+        /* In mock mode, seed a local route for the agent to advertise */
         if (mock_ovs)
         {
             char local_prefix[48];
@@ -184,23 +175,14 @@ int main(int argc, char *argv[])
         start.timestamp_us = a2a_now_us();
         fsm_process(agent, &start);
 
-        /*
-         * Drain any events that agent_create may have enqueued
-         * (discovery announcements, internal transitions) before the
-         * main loop begins.  This ensures the FSM is in DISCOVERY
-         * before the first inbound TCP message can arrive and be
-         * dispatched — otherwise INIT + MSG_RECEIVED is unregistered
-         * and the message is silently dropped.
-         */
+        /* Drain events enqueued during create so FSM is in DISCOVERY
+         * before the first inbound TCP message arrives. */
         a2a_event_t ev;
         while (event_queue_pop(&agent->eq, &ev) == 0)
             fsm_process(agent, &ev);
     }
 
-    /* ── Optional: seed a known L3 peer for cross-subnet bootstrap ─
-     *  In production, UDP multicast handles peer discovery within a
-     *  subnet.  For agents on different subnets, --l3-host/--l3-port
-     *  provides an initial contact point.                            */
+    /* Seed a known L3 peer for cross-subnet bootstrap (--l3-host/--l3-port) */
     if (l3_host[0] && l3_port > 0)
     {
         char peer_id[A2A_MAX_AGENT_ID];
@@ -235,11 +217,7 @@ int main(int argc, char *argv[])
     while (g_running)
     {
 
-        /*
-         * 1. TCP + OVSDB + Netlink (via epoll).
-         *    epoll_wait timeout = 5ms so the loop is not a busy-spin
-         *    but still reacts within 5ms to any network event.
-         */
+        /* 1. epoll: TCP + OVSDB + Netlink (5ms timeout avoids busy-spin) */
         a2a_server_poll(agent->server, 5);
 
         uint64_t now = a2a_now_us();
@@ -261,18 +239,9 @@ int main(int argc, char *argv[])
             {
                 agent_peer_t *_p = &agent->peers[_i];
 
-                /* Retry if:
-                 *   (a) peer is dead (alive==0), OR
-                 *   (b) peer is alive but has NEVER exchanged a heartbeat
-                 *       (last_heartbeat_us was set to now() at add-time, so
-                 *        check registered_at_us == 0 OR age < 3s means it
-                 *        was just added — use msgs_received proxy: if peer
-                 *        has no inbound HB yet, re-trigger discovery).
-                 * The simplest correct guard: retry if peer has no
-                 * confirmed two-way comms yet, detected by
-                 * last_heartbeat_us being within 1s of registered_at_us
-                 * (i.e., it was just stamped at add-time, not by a real HB).
-                 */
+                /* Retry REGISTER if peer is dead or has no confirmed
+                 * bidirectional comms yet (last_heartbeat_us within 1s
+                 * of registered_at_us means no real HB received). */
                 int needs_register =
                     !_p->alive ||
                     (_p->alive && _p->registered_at_us > 0 &&
@@ -327,18 +296,10 @@ int main(int argc, char *argv[])
         {
             g_dump_state = 0;
 
-            /*
-             * Update throughput/CPU metrics before dumping.
-             * metrics_record_latency() is called per-message so
-             * latency data is always current.
-             */
+            /* Refresh throughput/CPU before dump; latency is per-message */
             metrics_update(&g_metrics, agent);
 
-            /*
-             * JSON metrics line — parseable by monitoring tools.
-             * Format: {"metrics":{...}}\n
-             * Each SIGUSR1 produces exactly one line.
-             */
+            /* JSON metrics line — one line per SIGUSR1, parseable by monitoring */
             metrics_dump(&g_metrics, agent, l2, l3);
 
             /* Human-readable state for log inspection */

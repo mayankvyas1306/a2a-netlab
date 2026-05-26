@@ -1,13 +1,9 @@
 /*
- * ovs_ovsdb.c — OVSDB JSON-RPC monitor implementation
+ * OVSDB JSON-RPC monitor
  *
- * Connects to /var/run/openvswitch/db.sock and subscribes to:
- *   Port      → name, link_state, interfaces
- *   Interface → name, statistics, ofport, link_state, admin_state
- *   Bridge    → name, ports
- *
- * Maintains an in-memory shadow of the Interface table so that
- * ovs_interface.c can query port stats without any popen/system call.
+ * Subscribes to Port, Interface, and Bridge tables via db.sock.
+ * Maintains an in-memory shadow so ovs_interface.c can query
+ * port stats without popen/system.
  */
 
 #include <stdio.h>
@@ -153,15 +149,8 @@ int ovsdb_connect(void)
 
 int ovsdb_send_monitor(int fd)
 {
-    /*
-     * Monitor three tables:
-     *   Port      → link_state, interfaces list
-     *   Interface → statistics map, ofport, link_state, admin_state
-     *   Bridge    → name, ports
-     *
-     * The OVSDB monitor protocol sends us the full initial state as a
-     * single response, then incremental updates thereafter.
-     */
+    /* Monitor Port, Interface, and Bridge tables.
+     * Initial response contains full state; incremental updates follow. */
     const char *req =
         "{\"method\":\"monitor\","
         "\"params\":[\"Open_vSwitch\",null,"
@@ -191,10 +180,7 @@ int ovsdb_send_monitor(int fd)
 
 /* ── Helpers for OVSDB value extraction ─────────────────────────── */
 
-/*
- * OVSDB encodes optional/atomic values as either a plain scalar
- * or a 2-element array ["type", value].  Extract string value safely.
- */
+/* OVSDB encodes optionals as either scalars or ["type", value] arrays. */
 static const char *ovsdb_str(cJSON *item)
 {
     if (!item) return NULL;
@@ -203,8 +189,7 @@ static const char *ovsdb_str(cJSON *item)
     {
         cJSON *val = cJSON_GetArrayItem(item, 1);
         if (cJSON_IsString(val)) return val->valuestring;
-        
-        /* FIX: Handle OVSDB ["set", ["string"]] arrays for Link States */
+                /* Handle OVSDB ["set", ["string"]] wrapper */
         if (cJSON_IsArray(val) && cJSON_GetArraySize(val) == 1) {
             cJSON *inner = cJSON_GetArrayItem(val, 0);
             if (cJSON_IsString(inner)) return inner->valuestring;
@@ -213,10 +198,7 @@ static const char *ovsdb_str(cJSON *item)
     return NULL;
 }
 
-/*
- * Parse an OVSDB statistics map:
- *   ["map", [["rx_packets", N], ["tx_packets", N], ...]]
- */
+/* Parse OVSDB statistics map: ["map", [["key", value], ...]] */
 static void parse_statistics_map(cJSON *jstats, ovsdb_iface_shadow_t *iface)
 {
     if (!jstats || !cJSON_IsArray(jstats))
@@ -314,7 +296,7 @@ static void process_interface_table(cJSON *iface_table, a2a_agent_t *agent)
             }
         }
 
-        /* PERFECT PARSING: Catch the ["set", []] empty array meaning DOWN */
+        /* Handle OVSDB ["set", []] meaning DOWN */
         int is_up = 1;
         if (jlink) {
             if (cJSON_IsString(jlink) && strcmp(jlink->valuestring, "up") == 0) {
@@ -348,14 +330,7 @@ static void process_interface_table(cJSON *iface_table, a2a_agent_t *agent)
         if (was_up && !iface->link_up && agent && agent->card.type == AGENT_TYPE_L2 && agent->userdata) {
             l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;
             if (port_no > 0) {
-                /*
-                 * Check link_down_reported to prevent duplicate events.
-                 * l2_port_poll() is the primary detection path and sets
-                 * link_down_reported=1 after firing. The OVSDB monitor is
-                 * a faster path (fires before the next poll cycle). Use
-                 * OVSDB as primary: set link_down_reported here so poll
-                 * path does not fire a duplicate event.
-                 */
+                /* Prevent duplicate link-down events (OVSDB fires before poll) */
                 int already_reported = 0;
                 for (int pi = 0; pi < ctx->port_count; pi++)
                 {
@@ -396,11 +371,7 @@ static void process_port_table(cJSON *port_table, a2a_agent_t *agent)
     if (!port_table || !agent || !agent->userdata)
         return;
 
-    /*
-     * This handler only makes sense for L2 agents — L3 agents do not
-     * have a port table.  Guard on agent type to prevent UB from casting
-     * l3_agent_ctx_t* as l2_agent_ctx_t*.
-     */
+    /* Guard: only L2 agents have a port table */
     if (agent->card.type != AGENT_TYPE_L2)
         return;
 
@@ -437,11 +408,7 @@ static void process_port_table(cJSON *port_table, a2a_agent_t *agent)
 
         if (strcmp(state, "down") == 0)
         {
-            /* Interface table already fires A2A_EV_OVS_LINK_DOWN when it
-             * detects link_state change. The Port table is a duplicate path.
-             * Log only — do not push a second event. The poll path in
-             * l2_port_poll() serves as the third (deduplicated) detection
-             * mechanism via link_down_reported flag. */
+            /* Interface table already fires link-down; log only here */
             LOG_W("OVSDB", "Port table: LINK DOWN if=%s port=%d (no duplicate event)",
                   ifname, port_no);
         }
@@ -466,11 +433,7 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent)
         return;
     }
 
-    /*
-     * Both the initial monitor response (method=null, result=<tables>)
-     * and incremental updates (method="update", params=[id, <tables>])
-     * carry table data.  Handle both formats.
-     */
+    /* Handle both initial monitor response and incremental updates */
     cJSON *tables = NULL;
 
     cJSON *method = cJSON_GetObjectItem(root, "method");

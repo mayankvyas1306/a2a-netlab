@@ -53,7 +53,7 @@ int a2a_deserialize(const char *json, a2a_message_t *msg) {
     return 0;
 }
 
-/* Example for l2_event — same pattern for all others */
+/* ── l2_event ────────────────────────────────────────────────────────── */
 int a2a_msg_set_l2_event(a2a_message_t *msg, const l2_event_payload_t *pl) {
     cJSON *j = cJSON_CreateObject();
     if (!j) return -1;
@@ -63,12 +63,12 @@ int a2a_msg_set_l2_event(a2a_message_t *msg, const l2_event_payload_t *pl) {
     cJSON_AddNumberToObject(j, "pkt_count",   pl->pkt_count);
     cJSON_AddNumberToObject(j, "is_anomaly",  pl->is_anomaly);
     cJSON_AddNumberToObject(j, "anomaly_pps", pl->anomaly_pps);
-    cJSON_AddStringToObject(j, "reason",      pl->reason);   /* ← ADD */
+    cJSON_AddStringToObject(j, "reason",      pl->reason);
     char *s = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     if (!s) return -1;
     strncpy(msg->payload, s, A2A_MAX_PAYLOAD - 1);
-    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0'; /* guarantee null termination */
+    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0';
     msg->payload_len = strlen(msg->payload);
     msg->msg_type    = MSG_L2_EVENT;
     free(s);
@@ -92,7 +92,7 @@ int a2a_msg_get_l2_event(const a2a_message_t *msg, l2_event_payload_t *pl) {
         pl->is_anomaly = (int)item->valuedouble;
     if ((item = cJSON_GetObjectItem(j, "anomaly_pps")))
         pl->anomaly_pps = (uint32_t)item->valuedouble;
-    if ((item = cJSON_GetObjectItem(j, "reason")))    /* ← ADD */
+    if ((item = cJSON_GetObjectItem(j, "reason")))
         strncpy(pl->reason, item->valuestring, 63);
     cJSON_Delete(j);
     return 0;
@@ -112,7 +112,7 @@ int a2a_msg_set_l3_event(a2a_message_t *msg, const l3_event_payload_t *pl) {
     cJSON_Delete(j);
     if (!s) return -1;
     strncpy(msg->payload, s, A2A_MAX_PAYLOAD - 1);
-    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0'; /* guarantee null termination */
+    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0';
     msg->payload_len = strlen(msg->payload);
     msg->msg_type    = MSG_L3_EVENT;
     free(s);
@@ -152,7 +152,7 @@ int a2a_msg_set_register(a2a_message_t *msg, const register_payload_t *pl) {
     cJSON_Delete(j);
     if (!s) return -1;
     strncpy(msg->payload, s, A2A_MAX_PAYLOAD - 1);
-    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0'; /* guarantee null termination */
+    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0';
     msg->payload_len = strlen(msg->payload);
     msg->msg_type    = MSG_REGISTER;
     free(s);
@@ -187,7 +187,7 @@ int a2a_msg_set_heartbeat(a2a_message_t *msg, const heartbeat_payload_t *pl) {
     cJSON_Delete(j);
     if (!s) return -1;
     strncpy(msg->payload, s, A2A_MAX_PAYLOAD - 1);
-    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0'; /* guarantee null termination */
+    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0';
     msg->payload_len = strlen(msg->payload);
     msg->msg_type    = MSG_HEARTBEAT;
     free(s);
@@ -223,7 +223,7 @@ int a2a_msg_set_flow(a2a_message_t *msg, const flow_install_payload_t *pl) {
     cJSON_Delete(j);
     if (!s) return -1;
     strncpy(msg->payload, s, A2A_MAX_PAYLOAD - 1);
-    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0'; /* guarantee null termination */
+    msg->payload[A2A_MAX_PAYLOAD - 1] = '\0';
     msg->payload_len = strlen(msg->payload);
     msg->msg_type    = MSG_FLOW_INSTALL;
     free(s);
@@ -262,6 +262,7 @@ int a2a_msg_set_l2_anomaly(a2a_message_t *msg, const l2_anomaly_payload_t *pl) {
     cJSON_AddNumberToObject(j, "mac_count", pl->mac_count);
     cJSON_AddStringToObject(j, "mac", pl->mac);
     cJSON_AddStringToObject(j, "reason", pl->reason);
+    cJSON_AddStringToObject(j, "ifname", pl->ifname);
 
     char *s = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
@@ -297,7 +298,10 @@ int a2a_msg_get_l2_anomaly(const a2a_message_t *msg, l2_anomaly_payload_t *pl) {
         strncpy(pl->mac, item->valuestring, 17);
     if ((item = cJSON_GetObjectItem(j, "reason")))
         strncpy(pl->reason, item->valuestring, 63);
-
+    cJSON *ifname = cJSON_GetObjectItem(j, "ifname");
+    if (ifname) {
+        strncpy(pl->ifname, ifname->valuestring, sizeof(pl->ifname)-1);
+    }
     cJSON_Delete(j);
     return 0;
 }

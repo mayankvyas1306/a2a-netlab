@@ -39,10 +39,7 @@ static route_entry_t *find_route(l3_agent_ctx_t *ctx,
     return NULL;
 }
 
-/*
- * Find best alternate route for prefix that does NOT go
- * through failed_switch. Returns NULL if none found.
- */
+/* Find best alternate route avoiding failed_switch. */
 static route_entry_t *find_alternate(l3_agent_ctx_t *ctx,
                                      const char *prefix,
                                      const char *failed_switch)
@@ -80,17 +77,9 @@ static route_entry_t *find_alternate(l3_agent_ctx_t *ctx,
     return best;
 }
 
-/* Install a flow via OVS for the given route.
- *
- * Correct L3 forwarding action:
- *   1. dec_ttl            — decrement IP TTL (required for routing)
- *   2. mod_dl_dst:<mac>   — rewrite dst MAC to next-hop MAC (from ARP cache)
- *   3. mod_dl_src:<mac>   — rewrite src MAC to local bridge MAC
- *   4. output:<ofport>    — forward out the egress OpenFlow port
- *
- * Falls back to output:normal when ARP is not yet resolved.
- */
-/* Install a flow via OVS for the given route. */
+/* Install an OVS flow for a route entry.
+ * L3 forwarding: dec_ttl + MAC rewrite + port output.
+ * Falls back to output:normal when ARP is unresolved. */
 void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
 {
     char nexthop_mac[18] = "";
@@ -292,6 +281,58 @@ int l3_withdraw_route(l3_agent_ctx_t *ctx, const char *prefix,
     return 0;
 }
 
+static int l3_find_secondary_iface(l3_agent_ctx_t *ctx,
+                                   const char *failed_switch,
+                                   char *out, size_t outlen)
+{
+    FILE *f = popen("ip link show up | awk -F': ' '/^[0-9]+:/{print $2}'", "r");
+    if (!f) return -1;
+
+    char line[64];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *n = line;
+        char *at = strchr(n, '@');
+        if (at) *at = '\0';
+        
+        size_t len = strlen(n);
+        if (len < 4) continue;
+        if (n[0] != 'c') continue;
+        if (!(n[1] >= '1' && n[1] <= '9')) continue;
+        if (n[2] != 's') continue;
+        if (!(n[3] >= '1' && n[3] <= '9')) continue;
+        
+        const char *sw_dp = failed_switch;
+        while (*sw_dp && !(*sw_dp >= '0' && *sw_dp <= '9')) sw_dp++;
+        if (*sw_dp && (n[3] == *sw_dp)) continue; 
+        
+        strncpy(out, n, outlen - 1);
+        out[outlen - 1] = '\0';
+        found = 1;
+        break;
+    }
+    pclose(f);
+    return found ? 0 : -1;
+}
+
+static int l3_get_br0_ip(const char *bridge, char *out, size_t outlen)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "ip addr show %s 2>/dev/null | awk '/inet /{split($2,a,\"/\");print a[1];exit}'",
+             bridge);
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
+    if (fgets(out, outlen, f)) {
+        out[strcspn(out, "\n")] = '\0';
+        pclose(f);
+        return out[0] ? 0 : -1;
+    }
+    pclose(f);
+    return -1;
+}
+
 void l3_reroute_around(l3_agent_ctx_t *ctx,
                        const char *failed_switch, int failed_port)
 {
@@ -306,27 +347,11 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
 
         /*
          * Match routes affected by this failure.
-         *
-         * L2 agents report their own switch_id (e.g., "sw1").
-         * L3 routes store via_switch as the local router id (e.g., "core1").
-         * Direct name comparison never matches.
-         *
-         * Instead: a route is affected if its egress interface is the
-         * access-side port connected to the reporting switch.
-         *
-         * The access port naming convention is:
-         *   core1's access port to sw1 = c1s1 (configured in network_setup.sh)
-         *   core2's access port to sw3 = c2s3, etc.
-         *
-         * We detect this by checking whether the egress interface name
-         * contains the failed switch's numeric ID.
-         * E.g., failed_switch="sw1" → digit='1' → matches c1s1, s1c1, etc.
-         *
-         * For port-based matching: failed_port matches the OVS ofport
-         * of the access interface (port 1 = c1s1 on core1).
-         *
-         * Use EITHER criterion: egress ifname contains switch digit,
-         * OR egress_ifname is empty (local direct routes via br0).
+         * Routes are affected if the egress interface is an access port
+         * connected to the reporting switch.  Access port naming convention:
+         *   core1's port to sw1 = c1s1 (digit from switch name matched
+         *   after 's' in interface name).
+         * Port-based: failed_port matches OVS ofport directly.
          */
         int affected = 0;
 
@@ -364,18 +389,17 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
         if (!affected)
             continue;
 
-        // This route goes through the failed switch/port.
-        // Find an alternate path.
+        /* Route goes through failed switch/port — find alternate */
         route_entry_t *alt = find_alternate(ctx, r->prefix, r->via_switch);
 
         if (alt)
         {
-            // Withdraw the broken flow and install the alternate
+            /* Withdraw broken flow, install alternate */
             withdraw_route_flow(ctx, r);
             r->state = ROUTE_STATE_WITHDRAWN;
             ctx->route_withdrawals++;
 
-            // Install the alternate route flow
+            /* Install alternate route flow */
             install_route_flow(ctx, alt);
             ctx->reroutes_performed++;
 
@@ -390,171 +414,32 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
             LOG_W("L3", "[%s] No alternate found for %s — marking degraded",
                   ctx->switch_id, r->prefix);
 
-            /*
-             * Even without an OVS-level alternate route, we must fix the
-             * kernel routing table so return traffic can reach the subnet
-             * via the secondary access port (c1s2 when c1s1 is down).
-             *
-             * The secondary port naming convention:
-             *   Primary:   cNsM   (e.g., c1s1 for core1→sw1)
-             *   Secondary: cNsM'  (e.g., c1s2 for core1→sw2)
-             *
-             * When sw1 (digit=1) fails and egress=c1s1, the secondary
-             * access is c1s2. We add a kernel host route via the secondary
-             * port so return traffic reaches sw2→sw1→hosts.
-             *
-             * This is a kernel-level fix; the OVS flow on core1 can still
-             * use output:normal since c1s2 is a kernel interface not in OVS.
-             */
-            if (r->egress_ifname[0] && sw_digit != '\0')
-            {
-                /* Build secondary port name: replace digit at position */
-                char sec_if[IF_NAMESIZE] = {0};
-                strncpy(sec_if, r->egress_ifname, sizeof(sec_if)-1);
-
-                /*
-                 * Find the switch digit in the egress ifname and
-                 * determine secondary switch.
-                 * sw1↔sw2, sw3↔sw4, sw5↔sw6, sw7↔sw8.
-                 * Secondary digit: odd→even, even→odd.
-                 */
-                char sec_digit = '\0';
-                int sw_num = sw_digit - '0';
-                if (sw_num >= 1 && sw_num <= 8)
-                {
-                    /* pair: (1,2), (3,4), (5,6), (7,8) */
-                    int sec_num = (sw_num % 2 == 1) ? sw_num + 1 : sw_num - 1;
-                    sec_digit = '0' + sec_num;
-                }
-
-                if (sec_digit != '\0')
-                {
-                    /* Replace the switch digit in the interface name */
-                    for (int ci = 0; sec_if[ci]; ci++)
-                    {
-                        if (sec_if[ci] == sw_digit &&
-                            ci > 0 && sec_if[ci-1] == 's')
-                        {
-                            sec_if[ci] = sec_digit;
-                            break;
-                        }
-                    }
-
-                    /* Verify secondary interface exists and is up */
-                    char chk[128];
-                    snprintf(chk, sizeof(chk),
-                             "ip link show %s 2>/dev/null | grep -q 'state UP'",
-                             sec_if);
-                    if (system(chk) == 0)
-                    {
-                        /*
-                         * Add kernel route for the subnet via secondary if.
-                         * Use 'ip route replace' to be idempotent.
-                         * metric=50 to prefer the primary when it comes back.
-                         */
-                        char cmd[256];
-                        snprintf(cmd, sizeof(cmd),
-                                 "ip route replace %s dev %s metric 50 2>/dev/null",
-                                 r->prefix, sec_if);
-                        (void)system(cmd);
-
-                        LOG_I("L3", "[%s] Kernel route repair: %s via dev %s (secondary access)",
-                              ctx->switch_id, r->prefix, sec_if);
-
-                        r->state = ROUTE_STATE_DEGRADED;
-                    }
-                    else
-                    {
-                        LOG_W("L3", "[%s] Secondary if %s not UP — cannot repair kernel route",
-                              ctx->switch_id, sec_if);
-                    }
-                }
-            }
-
         }
     }
 
-    /*
-     * Direct kernel route repair for the access subnet.
-     *
-     * The route-matching loop above fails for directly-connected subnets
-     * because the kernel reports egress_ifname="br0" (the OVS bridge),
-     * not the physical port name "c1s1". The digit-matching logic
-     * never matches "br0", so the kernel route repair is skipped.
-     *
-     * Fix: directly compute the subnet and secondary interface from
-     * the topology naming convention and install the route.
-     *
-     * Topology mapping:
-     *   sw1 down -> core1 needs 10.0.0.0/24 via c1s2
-     *   sw3 down -> core2 needs 20.0.0.0/24 via c2s4
-     *   sw5 down -> core3 needs 30.0.0.0/24 via c3s6
-     *   sw7 down -> core4 needs 40.0.0.0/24 via c4s8
-     *
-     * Only odd-numbered switches need repair (they connect to the
-     * primary port on the core's br0). Even-numbered switches connect
-     * to the secondary port which is a raw kernel interface -- when
-     * they fail, the primary route via br0 still works.
-     *
-     * We use "ip route replace" (no metric) to REPLACE the unusable
-     * br0 route. metric=50 doesn't work because the kernel always
-     * prefers the metric=0 br0 route even when br0's only port is down
-     * (br0 itself stays UP as a virtual device).
-     */
     {
-        const char *sw_dp = failed_switch;
-        while (*sw_dp && !(*sw_dp >= '0' && *sw_dp <= '9'))
-            sw_dp++;
-        if (*sw_dp)
-        {
-            int sw_n = *sw_dp - '0';
-            /* Only odd switches need repair */
-            if (sw_n >= 1 && sw_n <= 8 && (sw_n % 2 == 1))
-            {
-                int sec_n = sw_n + 1;
-
-                /* Extract core digit from our own switch_id */
-                const char *cp = ctx->switch_id;
-                while (*cp && !(*cp >= '1' && *cp <= '9'))
-                    cp++;
-
-                if (*cp)
-                {
-                    char sec_if[32];
-                    snprintf(sec_if, sizeof(sec_if), "c%cs%d", *cp, sec_n);
-
-                    const char *subnet = NULL;
-                    if (sw_n == 1) subnet = "10.0.0.0/24";
-                    else if (sw_n == 3) subnet = "20.0.0.0/24";
-                    else if (sw_n == 5) subnet = "30.0.0.0/24";
-                    else if (sw_n == 7) subnet = "40.0.0.0/24";
-
-                    if (subnet)
-                    {
-                        char chk[128];
-                        snprintf(chk, sizeof(chk),
-                                 "ip link show %s 2>/dev/null | grep -q 'state UP'",
-                                 sec_if);
-                        if (system(chk) == 0)
-                        {
-                            char cmd[256];
-                            snprintf(cmd, sizeof(cmd),
-                                     "ip route replace %s dev %s 2>/dev/null",
-                                     subnet, sec_if);
-                            (void)system(cmd);
-
-                            LOG_I("L3", "[%s] Kernel route repair: %s via dev %s "
-                                  "(direct access failover)",
-                                  ctx->switch_id, subnet, sec_if);
-                        }
-                        else
-                        {
-                            LOG_W("L3", "[%s] Secondary if %s not UP",
-                                  ctx->switch_id, sec_if);
-                        }
-                    }
+        for (int ri = 0; ri < ctx->route_count; ri++) {
+            route_entry_t *r = &ctx->routes[ri];
+            if (r->state == ROUTE_STATE_WITHDRAWN) continue;
+            if (strcmp(r->egress_ifname, "br0") != 0 &&
+                strcmp(r->egress_ifname, ctx->bridge) != 0) continue;
+            if (!r->is_local) continue;
+            
+            char sec_if[IF_NAMESIZE];
+            if (l3_find_secondary_iface(ctx, failed_switch, sec_if, sizeof(sec_if)) == 0) {
+                char chk[128];
+                snprintf(chk, sizeof(chk),
+                         "ip link show %s 2>/dev/null | grep -q 'state UP'", sec_if);
+                if (system(chk) == 0) {
+                    char cmd[256];
+                    snprintf(cmd, sizeof(cmd),
+                             "ip route replace %s dev %s 2>/dev/null", r->prefix, sec_if);
+                    system(cmd);
+                    LOG_I("L3", "[%s] Kernel route repair: %s via dev %s (dynamic failover)",
+                          ctx->switch_id, r->prefix, sec_if);
                 }
             }
+            break; 
         }
     }
 }
@@ -671,11 +556,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
                    POLICY_RESTORE_PORT,
                    pl.port, NULL, 0);
 
-    /* Reset DEGRADED routes: storm has cleared, kernel route is still
-     * valid. The degraded state was set because no OVS alternate was
-     * found during the storm — but the route itself is still reachable.
-     * Without this reset, routes stay DEGRADED forever after a storm
-     * that clears without a subsequent link-flap cycle. */
+    /* Reset DEGRADED routes: storm cleared, route still reachable via kernel */
     {
         uint64_t now_us = a2a_now_us();
 
@@ -754,11 +635,8 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         LOG_I("L3", "Decision: FLOOD → isolate + reroute");
         l3_reroute_around(ctx, pl.switch_id, pl.port);
         /*
-         * Use RATE_LIMIT instead of ISOLATE_PORT for MAC-flood anomalies.
-         * ISOLATE cuts the port completely (including uplinks), which kills
-         * routing. Rate-limiting contains the flood while preserving
-         * connectivity for legitimate traffic.
-         * Rate = 2x reported pps as headroom for legitimate traffic.
+         * Use RATE_LIMIT instead of ISOLATE_PORT for MAC-flood:
+         * isolating uplink ports kills routing.
          */
         {
             uint32_t rate = pl.pps > 0 ? pl.pps * 2 : 10000;
@@ -785,73 +663,42 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         LOG_I("L3", "Decision: LINK_UP → restore routes for switch %s",
               pl.switch_id);
 
-        /*
-         * Restore the primary kernel route via br0 when the access
-         * link comes back up. This reverses the "ip route replace"
-         * done in l3_reroute_around.
-         *
-         * Also remove any metric=50 secondary routes that may have
-         * been installed by the old code path.
-         */
-        const char *sw_dp = pl.switch_id;
-        while (*sw_dp && !(*sw_dp >= '0' && *sw_dp <= '9'))
-            sw_dp++;
-
-        if (*sw_dp)
-        {
-            int sw_n = *sw_dp - '0';
-            if (sw_n >= 1 && sw_n <= 8 && (sw_n % 2 == 1))
-            {
-                int sec_n = sw_n + 1;
-
-                const char *cp = ctx->switch_id;
-                while (*cp && !(*cp >= '1' && *cp <= '9'))
-                    cp++;
-
-                if (*cp)
-                {
-                    char sec_if[32];
-                    snprintf(sec_if, sizeof(sec_if), "c%cs%d", *cp, sec_n);
-
-                    const char *subnet = NULL;
-                    const char *gw_ip = NULL;
-                    if (sw_n == 1) { subnet = "10.0.0.0/24"; gw_ip = "10.0.0.254"; }
-                    else if (sw_n == 3) { subnet = "20.0.0.0/24"; gw_ip = "20.0.0.254"; }
-                    else if (sw_n == 5) { subnet = "30.0.0.0/24"; gw_ip = "30.0.0.254"; }
-                    else if (sw_n == 7) { subnet = "40.0.0.0/24"; gw_ip = "40.0.0.254"; }
-
-                    if (subnet && gw_ip)
-                    {
-                        /* Restore primary route via br0 */
-                        char cmd[256];
-                        snprintf(cmd, sizeof(cmd),
-                                 "ip route replace %s dev br0 src %s 2>/dev/null",
-                                 subnet, gw_ip);
-                        (void)system(cmd);
-
-                        /* Also remove any stale metric=50 route */
-                        snprintf(cmd, sizeof(cmd),
-                                 "ip route del %s dev %s metric 50 2>/dev/null",
-                                 subnet, sec_if);
-                        (void)system(cmd);
-
-                        LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0, "
-                              "removed secondary via %s",
-                              ctx->switch_id, subnet, sec_if);
-                        for (int i = 0; i < ctx->route_count; i++) {
-                            if (strcmp(ctx->routes[i].nexthop, "0.0.0.0") != 0 && 
-                                ctx->routes[i].state == ROUTE_STATE_ACTIVE) {
-                                char cmd[256];
-                                snprintf(cmd, sizeof(cmd), 
-                                    "arping -c 2 -I %s %s >/dev/null 2>&1 &",
-                                    ctx->routes[i].egress_ifname,
-                                    ctx->routes[i].nexthop);
-                                system(cmd);
-                            }
-                        }
-                    }
+        for (int ri = 0; ri < ctx->route_count; ri++) {
+            route_entry_t *r = &ctx->routes[ri];
+            if (!r->is_local) continue;
+            if (strcmp(r->egress_ifname, "br0") != 0 &&
+                strcmp(r->egress_ifname, ctx->bridge) != 0) continue;
+                
+            char gw_ip[48] = "";
+            l3_get_br0_ip(ctx->bridge, gw_ip, sizeof(gw_ip));
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd),
+                     "ip route replace %s dev br0 src %s 2>/dev/null",
+                     r->prefix, gw_ip);
+            system(cmd);
+            
+            char sec_if[32];
+            if (l3_find_secondary_iface(ctx, pl.switch_id, sec_if, sizeof(sec_if)) == 0) {
+                snprintf(cmd, sizeof(cmd),
+                         "ip route del %s dev %s metric 50 2>/dev/null",
+                         r->prefix, sec_if);
+                system(cmd);
+            }
+            LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0 (dynamic)",
+                  ctx->switch_id, r->prefix);
+                  
+            for (int i = 0; i < ctx->route_count; i++) {
+                if (strcmp(ctx->routes[i].nexthop, "0.0.0.0") != 0 && 
+                    ctx->routes[i].state == ROUTE_STATE_ACTIVE) {
+                    char acmd[256];
+                    snprintf(acmd, sizeof(acmd), 
+                        "arping -c 2 -I %s %s >/dev/null 2>&1 &",
+                        ctx->routes[i].egress_ifname,
+                        ctx->routes[i].nexthop);
+                    system(acmd);
                 }
             }
+            break;
         }
 
         /* Also restore any DEGRADED routes tracked by the route table */
@@ -1558,12 +1405,8 @@ void l3_agent_destroy(l3_agent_ctx_t *ctx)
     if (!ctx)
         return;
 
-    /*
-     * Remove Netlink fd from epoll BEFORE destroying the server.
-     * If we close the fd first without removing it from epoll,
-     * epoll_wait may return a stale event on the closed fd and
-     * the handler dereferences ctx — use-after-free / segfault.
-     */
+    /* Remove Netlink fd from epoll BEFORE closing to prevent
+     * use-after-free from stale epoll events. */
     if (ctx->netlink_fd >= 0 && ctx->agent && ctx->agent->server)
     {
         a2a_server_del_fd(ctx->agent->server, ctx->netlink_fd);
@@ -1576,10 +1419,7 @@ void l3_agent_destroy(l3_agent_ctx_t *ctx)
 
 void l3_agent_tick(l3_agent_ctx_t *ctx)
 {
-    /*
-     * Periodic L3 maintenance and health monitoring.
-     * Runs from the main loop every few milliseconds.
-     */
+    /* Periodic L3 health monitoring (runs from main loop) */
 
     static uint64_t last_health_log_us = 0;
 
@@ -1679,18 +1519,7 @@ void l3_print_routes(l3_agent_ctx_t *ctx)
         "WITHDRAWN"
     };
 
-    /*
-     * Use structured logging instead of printf().
-     *
-     * In detached Docker/container environments,
-     * stdout is often not visible in runtime logs.
-     *
-     * LOG_I() ensures:
-     *   - docker logs visibility
-     *   - centralized logging
-     *   - timestamped output
-     *   - production-grade observability
-     */
+    /* LOG_I ensures visibility in container environments (docker logs) */
 
     LOG_I("L3",
           "[%s] Route Table (%d routes):",
@@ -1727,14 +1556,7 @@ void l3_print_routes(l3_agent_ctx_t *ctx)
               r->is_local ? " [local]" : "");
     }
 
-    /*
-     * Route convergence metrics.
-     *
-     * These metrics measure:
-     *   - failover convergence
-     *   - reroute convergence
-     *   - distributed recovery timing
-     */
+    /* Route convergence metrics */
 
     if (ctx->conv_count > 0)
     {

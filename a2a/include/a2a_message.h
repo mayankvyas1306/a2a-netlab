@@ -40,7 +40,7 @@ typedef struct {
     char reason[64];        /* "link_down", "metric_change", etc. */
 } l3_event_payload_t;
 
-/* MSG_HEARTBEAT (new message type, add to a2a_msg_type_t) */
+/* MSG_HEARTBEAT */
 typedef struct {
     uint64_t uptime_us;
     int      peer_count;
@@ -62,6 +62,7 @@ typedef struct {
     int      anomaly_type;   /* l2_anomaly_type_t */
     int      port;
     char     switch_id[A2A_MAX_AGENT_ID];
+    char     ifname[64];
     uint32_t pps;
     uint32_t mac_count;
     char     mac[18];       
@@ -98,8 +99,7 @@ typedef struct {
 
 } peer_list_payload_t;
 
-/* Add MSG_HEARTBEAT to the enum */
-/* Replace a2a_msg_type_t with: */
+/* A2A message types */
 typedef enum {
     MSG_PING          = 1,
     MSG_PONG          = 2,
@@ -129,7 +129,7 @@ typedef struct {
     uint32_t        payload_len;
 } a2a_message_t;
 
-/* typed anomaly system */
+/* L2 anomaly types */
 typedef enum {
     L2_ANOMALY_STORM = 1,
     L2_ANOMALY_FLOOD = 2,
@@ -140,14 +140,14 @@ typedef enum {
 } l2_anomaly_type_t;
 
 
-/* Helper: serialize a typed payload into msg->payload as JSON */
+/* Serialize typed payload into msg->payload (JSON) */
 int a2a_msg_set_l2_event(a2a_message_t *msg, const l2_event_payload_t *pl);
 int a2a_msg_set_l3_event(a2a_message_t *msg, const l3_event_payload_t *pl);
 int a2a_msg_set_register (a2a_message_t *msg, const register_payload_t *pl);
 int a2a_msg_set_heartbeat(a2a_message_t *msg, const heartbeat_payload_t *pl);
 int a2a_msg_set_flow     (a2a_message_t *msg, const flow_install_payload_t *pl);
 
-/* Helper: deserialize msg->payload into a typed struct */
+/* Deserialize msg->payload into typed struct */
 int a2a_msg_get_l2_event(const a2a_message_t *msg, l2_event_payload_t *pl);
 int a2a_msg_get_l3_event(const a2a_message_t *msg, l3_event_payload_t *pl);
 int a2a_msg_get_register (const a2a_message_t *msg, register_payload_t *pl);
