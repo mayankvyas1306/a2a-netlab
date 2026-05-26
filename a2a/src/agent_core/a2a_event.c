@@ -24,10 +24,7 @@ int event_queue_size(const event_queue_t *q) {
     return (int)((q->head - q->tail) & (EVENT_QUEUE_SIZE - 1));
 }
 
-/*
- * Map our internal event type to the FSM event type.
- * This is the bridge between the event system and the FSM.
- */
+/* Map internal event type to FSM event type */
 fsm_event_type_t ev_to_fsm(a2a_ev_type_t type) {
     switch (type) {
         case A2A_EV_MSG_RECEIVED:    return FSM_EVENT_MSG_RECEIVED;

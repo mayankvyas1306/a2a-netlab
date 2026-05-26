@@ -1,11 +1,8 @@
 /*
- * ovs_interface.c — OVS backend abstraction layer
+ * OVS backend abstraction layer
  *
- * REAL mode: all data comes from OVSDB shadow table (ovs_ovsdb.c)
- *            and OpenFlow socket (ovs_openflow.c).
- *            Zero popen() / system() calls.
- *
- * MOCK mode: synthesised data for unit testing without a live OVS.
+ * REAL mode: data from OVSDB shadow and OpenFlow socket (no popen/system).
+ * MOCK mode: synthesised data for unit testing without live OVS.
  */
 
 #include "ovs_interface.h"
@@ -50,15 +47,14 @@ int ovs_init(int use_mock)
     LOG_I("OVS", "Backend=%s", use_mock ? "MOCK" : "REAL");
     if (!use_mock)
     {
-        /* Prime the OpenFlow connection eagerly so errors surface early */
-        /* bridge name not known here; connection is deferred to first call */
+    /* Prime OpenFlow eagerly; bridge name unknown here, deferred */
     }
     return 0;
 }
 
 void ovs_cleanup(void)
 {
-    /* OpenFlow connection cleanup handled by ovs_openflow.c */
+    /* Cleanup handled by ovs_openflow.c */
 }
 
 /* ── Flow management ─────────────────────────────────────────────── */
@@ -98,11 +94,7 @@ int ovs_list_flows(const char *bridge, ovs_flow_t *out, int max)
 
 /* ── MAC / FDB ───────────────────────────────────────────────────── */
 
-/*
- * In real mode, the MAC table is populated by the OpenFlow PACKET_IN
- * handler in ovs_openflow.c — not polled.  This function returns a
- * snapshot of the in-memory table maintained there.
- */
+/* In real mode the MAC table is populated by PACKET_IN in ovs_openflow.c. */
 extern int ovs_of_get_mac_table(ovs_mac_entry_t *out, int max);
 
 int ovs_get_mac_table(const char *bridge, ovs_mac_entry_t *out, int max)
@@ -151,11 +143,7 @@ int ovs_get_port_stats(const char *bridge,
         return 0;
     }
 
-    /*
-     * Real path: read from OVSDB Interface.statistics shadow table.
-     * ovsdb_get_port_stats() is maintained by the OVSDB monitor callback
-     * in ovs_ovsdb.c — no popen(), no system().
-     */
+    /* Real path: read from OVSDB Interface.statistics shadow table. */
     return ovsdb_get_port_stats(ifname, out);
 }
 
@@ -187,12 +175,7 @@ int ovs_bridge_exists(const char *bridge)
     if (g_use_mock)
         return 1;
 
-/*
- * Check Bridge table in OVSDB shadow.
- * The Bridge table is monitored; a simple name lookup suffices.
- * For now we attempt an OpenFlow connection — if it succeeds, the
- * bridge exists.
- */
+/* Probe bridge existence via OpenFlow connection attempt. */
 #ifdef ENABLE_L2_OPENFLOW
     int fd = ovs_of_connect(bridge);
 #else
@@ -200,7 +183,7 @@ int ovs_bridge_exists(const char *bridge)
 #endif
     if (fd >= 0)
     {
-        /* Don't close — ovs_of_connect caches the fd internally */
+        /* ovs_of_connect caches the fd internally */
         return 1;
     }
     return 0;

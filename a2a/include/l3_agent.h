@@ -42,6 +42,22 @@ typedef struct {
     uint32_t      reroutes_performed;
     uint32_t      route_installs;
     uint32_t      route_withdrawals;
+    
+    /* OVSDB message reassembly buffer */
+    char          ovsdb_buf[262144];  /* 256KB buffer for large OVSDB JSON messages */
+    size_t        ovsdb_len;          /* Current buffer usage */
+
+    /* Route convergence tracking */
+    struct {
+        char     prefix[48];   /* Route prefix */
+        uint64_t withdraw_us;  /* Route withdrawal timestamp */
+        int      valid;        /* Entry active flag */
+    } conv_log[L3_MAX_ROUTES];
+
+    uint32_t conv_count;       /* Total convergence events */
+    uint64_t conv_sum_us;      /* Sum of convergence times */
+    uint64_t conv_min_us;      /* Minimum convergence time */
+    uint64_t conv_max_us;      /* Maximum convergence time */
 } l3_agent_ctx_t;
 
 /* Lifecycle */

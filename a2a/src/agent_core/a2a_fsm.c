@@ -11,9 +11,7 @@ void fsm_init(agent_fsm_t *fsm)
 {
     memset(fsm->table, 0, sizeof(fsm->table));
 
-    /* Default: every (state, event) pair → ERROR, no action.
-     * fsm_process treats a NULL action + ERROR target as "ignore"
-     * unless the state actually IS supposed to error. */
+    /* Default: every unregistered (state, event) → ERROR */
     for (int s = 0; s < FSM_STATE_COUNT; s++)
         for (int e = 0; e < FSM_EVENT_COUNT; e++)
         {
@@ -170,9 +168,7 @@ int fsm_process(a2a_agent_t *agent, const a2a_event_t *event)
           fsm_state_str(cur), fsm_event_str(ev),
           fsm_state_str(tr->to_state));
 
-    /* Transition state FIRST so that action callbacks see the new state.
-     * Actions that need to know the previous state can use the log or
-     * the event context — they must not rely on reading stale fsm_state. */
+    /* Transition state FIRST so action callbacks see the new state */
     agent->fsm_state = tr->to_state;
 
     if (tr->action)

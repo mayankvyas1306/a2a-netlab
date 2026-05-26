@@ -51,7 +51,7 @@ while [ $COUNT -lt $MAX_RETRIES ]; do
     C3=$(docker exec core3 vtysh -c "show ip ospf neighbor" 2>/dev/null | grep -c "Full" | tr -d '\n')
     C4=$(docker exec core4 vtysh -c "show ip ospf neighbor" 2>/dev/null | grep -c "Full" | tr -d '\n')
     TOT=$((C1 + C2 + C3 + C4))
-    if [ "$TOT" -ge 4 ]; then
+    if [ "$TOT" -ge 6 ]; then
         echo "OSPF converged (neighbors: core1=$C1 core2=$C2 core3=$C3 core4=$C4)"
         OSPF_READY=1
         break

@@ -31,10 +31,17 @@ typedef struct {
     char         switch_id[A2A_MAX_AGENT_ID];
     char         host[A2A_MAX_HOST_LEN];
     int          port;
-    uint64_t     last_heartbeat_us;
-    uint64_t     last_send_attempt_us; /* throttle dead-peer probe sends */
-    uint64_t     registered_at_us;
-    int          alive;
+
+    uint64_t     last_heartbeat_us;   /* last successful heartbeat rx */
+
+    uint64_t     last_send_attempt_us; /* throttle reconnect attempts */
+
+    uint64_t     registered_at_us;    /* first registration time */
+
+    uint64_t     tombstone_us;        /* alive→dead transition; 0 = alive */
+
+    int          alive;               /* current liveness state */
+
 } agent_peer_t;
 
 typedef struct {

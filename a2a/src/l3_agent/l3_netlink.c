@@ -1,15 +1,9 @@
 /*
- * l3_netlink.c — Real-time Linux routing monitor via RTNETLINK
+ * Real-time Linux routing monitor via RTNETLINK
  *
- * Subscribes to:
- *   RTMGRP_IPV4_ROUTE → RTM_NEWROUTE, RTM_DELROUTE
- *   RTMGRP_LINK       → RTM_NEWLINK,  RTM_DELLINK
- *   RTMGRP_IPV4_IFADDR → interface address changes
- *   RTMGRP_NEIGH      → ARP/neighbor table (next-hop MAC resolution)
- *
- * Dumps the initial route table on startup via RTM_GETROUTE.
- * The fd is returned and must be added to the agent's epoll loop.
- * l3_netlink_process() is called when epoll signals the fd readable.
+ * Subscribes to RTMGRP_IPV4_ROUTE, RTMGRP_LINK, RTMGRP_IPV4_IFADDR,
+ * and RTMGRP_NEIGH. Dumps initial routes on startup. The fd is added
+ * to the agent's epoll loop; l3_netlink_process() handles readability.
  */
 
 #define _GNU_SOURCE
@@ -71,8 +65,8 @@ static void neigh_update(uint32_t ip, const uint8_t *mac)
 }
 
 /*
- * Resolve a next-hop IP to its MAC address from the ARP cache.
- * Returns 0 on success (mac_out filled), -1 if not found.
+ * Resolve next-hop IP to MAC from ARP cache.
+ * Returns 0 on success, -1 if not found.
  */
 int l3_arp_resolve(const char *nexthop_ip, char *mac_out, int mac_out_sz)
 {
@@ -234,25 +228,43 @@ static void handle_link_change(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx,
 static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
 {
     struct ndmsg *ndm = NLMSG_DATA(nlh);
+
     if (ndm->ndm_family != AF_INET)
         return;
+
     if (!(ndm->ndm_state & (NUD_REACHABLE | NUD_STALE |
-                            NUD_DELAY | NUD_PROBE | NUD_PERMANENT)))
+                            NUD_DELAY | NUD_PROBE |
+                            NUD_PERMANENT)))
         return;
 
     uint32_t ip = 0;
     uint8_t mac[6] = {0};
     int has_ip = 0, has_mac = 0;
 
-    struct rtattr *rta = (struct rtattr *)((uint8_t *)ndm + sizeof(struct ndmsg));
-    int rta_len = (int)NLMSG_PAYLOAD(nlh, sizeof(struct ndmsg));
+    struct rtattr *rta =
+        (struct rtattr *)((uint8_t *)ndm +
+                          sizeof(struct ndmsg));
 
-    for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len))
+    int rta_len =
+        (int)NLMSG_PAYLOAD(nlh,
+                           sizeof(struct ndmsg));
+
+    for (; RTA_OK(rta, rta_len);
+         rta = RTA_NEXT(rta, rta_len))
     {
-        if (rta->rta_type == NDA_DST && RTA_PAYLOAD(rta) == 4)
-        { memcpy(&ip, RTA_DATA(rta), 4); has_ip = 1; }
-        if (rta->rta_type == NDA_LLADDR && RTA_PAYLOAD(rta) == 6)
-        { memcpy(mac, RTA_DATA(rta), 6); has_mac = 1; }
+        if (rta->rta_type == NDA_DST &&
+            RTA_PAYLOAD(rta) == 4)
+        {
+            memcpy(&ip, RTA_DATA(rta), 4);
+            has_ip = 1;
+        }
+
+        if (rta->rta_type == NDA_LLADDR &&
+            RTA_PAYLOAD(rta) == 6)
+        {
+            memcpy(mac, RTA_DATA(rta), 6);
+            has_mac = 1;
+        }
     }
 
     if (has_ip && has_mac)
@@ -260,25 +272,156 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
         neigh_update(ip, mac);
 
         char ip_str[INET_ADDRSTRLEN];
-        struct in_addr a; a.s_addr = ip;
-        inet_ntop(AF_INET, &a, ip_str, sizeof(ip_str));
-        LOG_D("NETLINK", "ARP: %s → %02x:%02x:%02x:%02x:%02x:%02x",
-              ip_str, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        struct in_addr a;
+        a.s_addr = ip;
 
-        /* FIX B4: Re-install flows for all active routes whose nexthop
-         * just became ARP-resolved.  Routes previously installed as
-         * output:NORMAL fallback will now get the correct L3 forwarding
-         * actions (dec_ttl + MAC rewrite + port output). */
-        if (ctx) {
-            char nh_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &a, nh_str, sizeof(nh_str));
-            for (int i = 0; i < ctx->route_count; i++) {
-                route_entry_t *r = &ctx->routes[i];
-                if (r->state == ROUTE_STATE_WITHDRAWN) continue;
-                if (strcmp(r->nexthop, nh_str) == 0) {
-                    LOG_I("NETLINK", "ARP resolved for nexthop %s — "
-                          "reinstalling flow for %s", nh_str, r->prefix);
-                    install_route_flow(ctx, r);
+        inet_ntop(AF_INET,
+                  &a,
+                  ip_str,
+                  sizeof(ip_str));
+
+        LOG_D("NETLINK",
+              "ARP: %s → %02x:%02x:%02x:%02x:%02x:%02x",
+              ip_str,
+              mac[0], mac[1], mac[2],
+              mac[3], mac[4], mac[5]);
+
+        /* Dedup: skip flow reinstall if same nexthop was processed
+         * within the last 5s (kernel sends rapid NUD transitions). */
+#define ARP_DEDUP_MAX 16
+#define ARP_DEDUP_US (5ULL * 1000000ULL)
+
+        {
+            static struct
+            {
+                uint32_t ip;
+                uint8_t mac[6];
+                uint64_t last_us;
+            } arp_seen[ARP_DEDUP_MAX];
+
+            static int arp_seen_count = 0;
+
+            uint64_t now_us = a2a_now_us();
+            int skip = 0;
+
+            for (int di = 0;
+                 di < arp_seen_count;
+                 di++)
+            {
+                if (arp_seen[di].ip == ip &&
+                    memcmp(arp_seen[di].mac,
+                           mac,
+                           6) == 0 &&
+                    (now_us -
+                     arp_seen[di].last_us)
+                        < ARP_DEDUP_US)
+                {
+                    skip = 1;
+                    break;
+                }
+
+                /* Update last_us if same IP/MAC but stale */
+                if (arp_seen[di].ip == ip &&
+                    memcmp(arp_seen[di].mac,
+                           mac,
+                           6) == 0)
+                {
+                    arp_seen[di].last_us =
+                        now_us;
+                }
+            }
+
+            if (!skip)
+            {
+                /* Add or update entry */
+                int found_slot = -1;
+
+                for (int di = 0;
+                     di < arp_seen_count;
+                     di++)
+                {
+                    if (arp_seen[di].ip == ip)
+                    {
+                        found_slot = di;
+                        break;
+                    }
+                }
+
+                if (found_slot < 0 &&
+                    arp_seen_count <
+                        ARP_DEDUP_MAX)
+                {
+                    found_slot =
+                        arp_seen_count++;
+                }
+
+                if (found_slot >= 0)
+                {
+                    arp_seen[found_slot].ip =
+                        ip;
+
+                    memcpy(
+                        arp_seen[found_slot].mac,
+                        mac,
+                        6);
+
+                    arp_seen[found_slot]
+                        .last_us = now_us;
+                }
+            }
+
+            if (skip)
+            {
+                LOG_D("NETLINK",
+                      "ARP dedup: "
+                      "skipping reinstall "
+                      "for %s "
+                      "(seen recently)",
+                      ip_str);
+
+                /* Note: neigh_update already
+                 * updated the cache above
+                 */
+            }
+            else if (ctx)
+            {
+                /* Reinstall flows for routes whose nexthop just got ARP-resolved.
+                 * Routes previously using output:NORMAL fallback get proper
+                 * L3 forwarding (dec_ttl + MAC rewrite + port output). */
+                char nh_str[INET_ADDRSTRLEN];
+
+                inet_ntop(AF_INET,
+                          &a,
+                          nh_str,
+                          sizeof(nh_str));
+
+                for (int i = 0;
+                     i < ctx->route_count;
+                     i++)
+                {
+                    route_entry_t *r =
+                        &ctx->routes[i];
+
+                    if (r->state ==
+                        ROUTE_STATE_WITHDRAWN)
+                    {
+                        continue;
+                    }
+
+                    if (strcmp(r->nexthop,
+                               nh_str) == 0)
+                    {
+                        LOG_I("NETLINK",
+                              "ARP resolved "
+                              "for nexthop %s — "
+                              "reinstalling "
+                              "flow for %s",
+                              nh_str,
+                              r->prefix);
+
+                        install_route_flow(ctx,
+                                           r);
+                    }
                 }
             }
         }
@@ -394,52 +537,221 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
             case RTM_NEWROUTE:
             {
                 parsed_route_t r;
+
                 if (parse_route_msg(nlh, &r) < 0)
                     break;
+
                 LOG_I("NETLINK", "RTM_NEWROUTE: %s via %s dev %s metric %d",
                       r.prefix, r.nexthop, r.ifname, r.metric);
 
-                const char *ifname = r.ifname[0] ? r.ifname : "kernel";
-                route_entry_t *ex = find_route_pub(ctx, r.prefix, ifname);
-                if (!ex)
-                {
+                /* Check for pending convergence timer */
+                for (int ci = 0; ci < L3_MAX_ROUTES; ci++) {
+
+                    if (!ctx->conv_log[ci].valid)
+                        continue;
+
+                    if (strcmp(ctx->conv_log[ci].prefix,
+                               r.prefix) != 0)
+                    {
+                        continue;
+                    }
+
+                    /* Compute convergence duration */
+                    uint64_t conv_us =
+                        a2a_now_us() -
+                        ctx->conv_log[ci].withdraw_us;
+
+                    ctx->conv_log[ci].valid = 0;
+
+                    /* Update convergence stats */
+                    ctx->conv_count++;
+                    ctx->conv_sum_us += conv_us;
+
+                    if (conv_us < ctx->conv_min_us)
+                        ctx->conv_min_us = conv_us;
+
+                    if (conv_us > ctx->conv_max_us)
+                        ctx->conv_max_us = conv_us;
+
+                    double avg_ms =
+                        (ctx->conv_count > 0)
+                        ? (double)ctx->conv_sum_us
+                          / ctx->conv_count / 1000.0
+                        : 0.0;
+
+                    LOG_I("NETLINK",
+                          "[%s] ROUTE CONVERGENCE: %s in %.1fms "
+                          "(min=%.1f avg=%.1f max=%.1f n=%u)",
+                          ctx->switch_id,
+                          r.prefix,
+                          (double)conv_us / 1000.0,
+                          ctx->conv_min_us == UINT64_MAX
+                              ? 0.0
+                              : (double)ctx->conv_min_us / 1000.0,
+                          avg_ms,
+                          (double)ctx->conv_max_us / 1000.0,
+                          ctx->conv_count);
+
+                    break;
+                }
+
+                const char *ifname =
+                    r.ifname[0] ? r.ifname : "kernel";
+
+                route_entry_t *ex =
+                    find_route_pub(ctx, r.prefix, ifname);
+
+                /* Add new route */
+                if (!ex) {
+
                     l3_add_route(ctx,
                                  r.prefix,
                                  r.nexthop,
                                  ctx->switch_id,
                                  ifname,
                                  r.metric,
-                                 1);
-                }
-                else if (r.metric < ex->metric)
-                {
-                    withdraw_route_flow(ctx, ex);
+                                 1 /* is_local */);
 
+                }
+                /* Update better route */
+                else if (r.metric < ex->metric) {
+
+                    withdraw_route_flow(ctx, ex);
                     strncpy(ex->nexthop, r.nexthop, sizeof(ex->nexthop) - 1);
                     ex->nexthop[sizeof(ex->nexthop) - 1] = '\0';
-
-                    strncpy(ex->egress_ifname, ifname,
-                            sizeof(ex->egress_ifname) - 1);
+                    strncpy(ex->egress_ifname, ifname, sizeof(ex->egress_ifname) - 1);
                     ex->egress_ifname[sizeof(ex->egress_ifname) - 1] = '\0';
-
                     ex->metric = r.metric;
-
                     install_route_flow(ctx, ex);
 
-                    LOG_I("NETLINK", "Route updated: %s new metric=%d",
-                          r.prefix, r.metric);
+                    LOG_I("NETLINK",
+                          "[%s] Route updated: %s new metric=%d",
+                          ctx->switch_id,
+                          r.prefix,
+                          r.metric);
                 }
-                break;
+                /* Reinstate previously WITHDRAWN entry if kernel re-adds it */
+                else if (ex->state == ROUTE_STATE_WITHDRAWN) {
+                    ex->state = ROUTE_STATE_ACTIVE;
+                    ex->metric = r.metric;
+                    ex->last_verified_us = a2a_now_us();
+                    install_route_flow(ctx, ex);
+                    LOG_I("NETLINK",
+                          "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
+                          ctx->switch_id, r.prefix, ifname, r.metric);
+                }
+
+                break;            
             }
 
             case RTM_DELROUTE:
             {
                 parsed_route_t r;
+
                 if (parse_route_msg(nlh, &r) < 0)
                     break;
-                LOG_I("NETLINK", "RTM_DELROUTE: %s via %s",
-                      r.prefix, r.nexthop);
-                l3_withdraw_route(ctx, r.prefix, "kernel_del");
+
+                LOG_I("NETLINK", "RTM_DELROUTE: %s via %s dev %s",
+                      r.prefix, r.nexthop, r.ifname);
+
+                /* Start convergence timer for withdrawn route */
+                uint64_t withdraw_time = a2a_now_us();
+
+                int recorded = 0;
+                int oldest_slot = 0;
+
+                uint64_t oldest_time = UINT64_MAX;
+
+                for (int ci = 0; ci < L3_MAX_ROUTES; ci++) {
+
+                    if (!ctx->conv_log[ci].valid) {
+
+                        /* Use free slot */
+                        strncpy(ctx->conv_log[ci].prefix,
+                                r.prefix,
+                                sizeof(ctx->conv_log[ci].prefix) - 1);
+
+                        ctx->conv_log[ci].withdraw_us = withdraw_time;
+                        ctx->conv_log[ci].valid       = 1;
+
+                        recorded = 1;
+
+                        LOG_D("NETLINK", "[%s] Convergence timer started "
+                              "for %s (slot=%d)",
+                              ctx->switch_id, r.prefix, ci);
+
+                        break;
+                    }
+
+                    /* Track oldest entry for replacement */
+                    if (ctx->conv_log[ci].withdraw_us < oldest_time) {
+                        oldest_time = ctx->conv_log[ci].withdraw_us;
+                        oldest_slot = ci;
+                    }
+                }
+
+                /* Replace oldest entry if table is full */
+                if (!recorded) {
+
+                    LOG_W("NETLINK", "[%s] conv_log full — overwriting "
+                          "slot %d (prefix=%s)",
+                          ctx->switch_id,
+                          oldest_slot,
+                          ctx->conv_log[oldest_slot].prefix);
+
+                    strncpy(ctx->conv_log[oldest_slot].prefix,
+                            r.prefix,
+                            sizeof(ctx->conv_log[oldest_slot].prefix) - 1);
+
+                    ctx->conv_log[oldest_slot].withdraw_us =
+                        withdraw_time;
+
+                    ctx->conv_log[oldest_slot].valid = 1;
+                }
+
+                /* Withdraw only the exact prefix+ifname entry the kernel deleted.
+                 * l3_withdraw_route() finds only the first prefix match. */
+                {
+                    const char *del_ifname =
+                        r.ifname[0] ? r.ifname : "kernel";
+                    int withdrew = 0;
+                    for (int wi = 0; wi < ctx->route_count; wi++) {
+                        route_entry_t *wr = &ctx->routes[wi];
+                        if (strcmp(wr->prefix, r.prefix) == 0 &&
+                            strcmp(wr->egress_ifname, del_ifname) == 0 &&
+                            wr->state != ROUTE_STATE_WITHDRAWN) {
+                            wr->state = ROUTE_STATE_WITHDRAWN;
+                            withdraw_route_flow(ctx, wr);
+                            ctx->route_withdrawals++;
+                            LOG_I("L3", "[%s] Route withdrawn: %s dev %s  reason=kernel_del",
+                                  ctx->switch_id, r.prefix, del_ifname);
+                            withdrew = 1;
+                            break;
+                        }
+                    }
+                    if (!withdrew) {
+                        /* Fallback: only call if specific prefix+ifname not found.
+                         * Skip if entry exists but is already WITHDRAWN. */
+                        int already_gone = 0;
+                        for (int wi = 0; wi < ctx->route_count; wi++) {
+                            route_entry_t *wr = &ctx->routes[wi];
+                            if (strcmp(wr->prefix, r.prefix) == 0 &&
+                                strcmp(wr->egress_ifname, del_ifname) == 0 &&
+                                wr->state == ROUTE_STATE_WITHDRAWN) {
+                                already_gone = 1;
+                                break;
+                            }
+                        }
+                        if (!already_gone) {
+                            l3_withdraw_route(ctx, r.prefix, "kernel_del");
+                        } else {
+                            LOG_D("L3", "[%s] RTM_DELROUTE: %s dev %s already WITHDRAWN — skipping",
+                                  ctx->switch_id, r.prefix, del_ifname);
+                        }
+                    }
+
+                }
+
                 break;
             }
 

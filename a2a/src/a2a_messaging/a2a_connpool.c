@@ -50,9 +50,7 @@ static int raw_connect(const char *host, int port)
         return -1;
     }
 
-    /* poll() instead of select() — same non-blocking connect, but
-     * does not artificially serialize on a 200ms timeout per call.
-     * 50ms is sufficient for LAN; longer means the peer is unreachable. */
+    /* poll() with 50ms timeout — sufficient for LAN connectivity check */
     struct pollfd pfd = {.fd = fd, .events = POLLOUT};
     if (poll(&pfd, 1, 50) <= 0 || !(pfd.revents & POLLOUT))
     {
@@ -142,10 +140,7 @@ static void pool_evict(conn_pool_t *pool, const char *key)
     e->fd = -1;
 }
 
-/* Public: evict the pooled connection to a specific peer.
- * Used by on_peer_timeout to close only the dead peer's socket
- * without touching connections to any other peer.
- */
+/* Evict a specific peer's connection without touching other peers. */
 void conn_pool_evict_peer(conn_pool_t *pool,
                           const char *host, int port)
 {
@@ -169,14 +164,12 @@ int conn_pool_send(conn_pool_t *pool,
     for (int attempt = 0; attempt < 2; attempt++)
     {
 
-        // ALWAYS try fresh connection after first failure
+        /* Always retry with fresh connection after first failure */
         pool_entry_t *e = pool_find(pool, key);
 
         if (attempt > 0 && e)
         {
-            /* Evict stale connection and wait briefly before retry.
-             * The remote TCP stack needs time to accept a new SYN
-             * after closing the previous connection. */
+            /* Evict stale connection; brief delay for TCP RST to clear */
             pool_evict(pool, key);
             e = NULL;
             usleep(50000); /* 50ms: enough for TCP RST to clear */
@@ -206,7 +199,7 @@ int conn_pool_send(conn_pool_t *pool,
 
         LOG_W("POOL", "send failed key=%s attempt=%d", key, attempt + 1);
 
-        //  ALWAYS evict on failure
+        /* Always evict on failure */
         pool_evict(pool, key);
     }
 
@@ -223,11 +216,8 @@ void conn_pool_gc(conn_pool_t *pool, uint64_t idle_us)
         pool_entry_t *e = &pool->entries[i];
         if (!e->valid)
             continue;
-        /*
-         * Skip entries whose last_used_us is 0 (just-allocated,
-         * never sent through).  now - 0 wraps to a huge number
-         * and would immediately evict a freshly-opened connection.
-         */
+        /* Skip entries with last_used_us==0 (never sent through);
+         * now - 0 wraps and would evict a fresh connection. */
         if (e->last_used_us == 0)
             continue;
         if (now - e->last_used_us > idle_us)
