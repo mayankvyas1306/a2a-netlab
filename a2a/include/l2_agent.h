@@ -16,13 +16,20 @@
 #define L2_POLL_INTERVAL_US (50ULL * 1000ULL)    /* 50ms */
 #define L2_MAC_SYNC_INTERVAL (2ULL * 1000000ULL) /* 2s   */
 
-typedef struct
-{
+#define MAC_SPOOF_WINDOW_US  (10ULL * 1000000ULL)  /* 10-second window */
+#define MAC_SPOOF_THRESHOLD  3                      /* 3 port changes = alert */
+#define MAC_SPOOF_MAX_EVENTS 16                     /* ring buffer size, must be power of 2 */
+
+typedef struct {
     char mac[18];
     int port;
     uint64_t learned_at_us;
     uint64_t last_seen_us;
     uint32_t pkt_count;
+    uint64_t port_change_times[MAC_SPOOF_MAX_EVENTS]; /* ring buffer of timestamps */
+    int      port_change_head;   /* index of next write position */
+    int      port_change_count;  /* total events recorded (capped at MAC_SPOOF_MAX_EVENTS) */
+    int      spoof_alerted;      /* 1 = already sent alert, prevents spam */
 } mac_entry_t;
 
 typedef struct

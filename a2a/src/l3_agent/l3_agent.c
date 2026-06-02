@@ -646,12 +646,37 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         }
         break;
 
-    case L2_ANOMALY_MAC_SPOOF:
-        LOG_I("L3", "Decision: MAC_SPOOF → blackhole");
-        l3_send_policy(ctx, msg->src_agent,
-                       POLICY_BLACKHOLE_MAC,
-                       pl.port, pl.mac, 0);
-        break;
+        case L2_ANOMALY_MAC_SPOOF: {
+            a2a_agent_t *agent = ctx->agent;
+            /* Build a BLACKHOLE policy command back to the L2 agent */
+            policy_cmd_payload_t pcmd = {0};
+            pcmd.policy_type = POLICY_BLACKHOLE_MAC;
+            strncpy(pcmd.mac, pl.mac, sizeof(pcmd.mac) - 1);
+            pcmd.port = pl.port;
+            
+
+            a2a_message_t pmsg = {0};
+            pmsg.msg_id = ++agent->msg_counter;
+            pmsg.msg_type = MSG_POLICY_CMD;
+            pmsg.timestamp_us = a2a_now_us();
+            strncpy(pmsg.src_agent, agent->card.agent_id, A2A_MAX_AGENT_ID - 1);
+            strncpy(pmsg.dst_agent, pl.switch_id, A2A_MAX_AGENT_ID - 1);
+
+            a2a_msg_set_policy_cmd(&pmsg, &pcmd);
+
+            /* Send back to the L2 agent that reported it */
+            for (int i = 0; i < agent->peer_count; i++) {
+                if (strcmp(agent->peers[i].switch_id, pl.switch_id) == 0) {
+                    conn_pool_send(&agent->pool,
+                                   agent->peers[i].host,
+                                   agent->peers[i].port,
+                                   &pmsg);
+                    break;
+                }
+            }
+            LOG_W("L3", "Sent BLACKHOLE_MAC for %s to switch %s", pl.mac, pl.switch_id);
+            break;
+        }
 
     case L2_ANOMALY_LINK_DOWN:
         LOG_I("L3", "Decision: LINK_DOWN → reroute");
