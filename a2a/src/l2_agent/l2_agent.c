@@ -342,6 +342,7 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                 {
                     ovs_flow_t fl = {0};
                     fl.priority = 300;
+                    fl.idle_timeout = 300;
                     snprintf(fl.match, sizeof(fl.match),
                              "dl_src=%s", pl.mac);
                     snprintf(fl.actions, sizeof(fl.actions),
@@ -501,6 +502,66 @@ static void on_heartbeat_tick(a2a_agent_t *agent, const a2a_event_t *ev)
     heartbeat_check_peers(agent);
 }
 
+/* Count how many port-change events fall inside the sliding window */
+static int mac_count_events_in_window(mac_entry_t *entry, uint64_t now_us)
+{
+    int count = 0;
+    int total = entry->port_change_count < MAC_SPOOF_MAX_EVENTS
+                ? entry->port_change_count
+                : MAC_SPOOF_MAX_EVENTS;
+
+    for (int i = 0; i < total; i++) {
+        /* Check if this timestamp is within the last MAC_SPOOF_WINDOW_US microseconds */
+        if (now_us >= entry->port_change_times[i] &&
+            (now_us - entry->port_change_times[i]) <= MAC_SPOOF_WINDOW_US) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Record a port change event and check if threshold is crossed */
+static void mac_check_spoof_window(l2_agent_ctx_t *ctx,
+                                   mac_entry_t *entry,
+                                   int new_port,
+                                   uint64_t now_us)
+{
+    /* Record the timestamp of this port-change event into the ring buffer */
+    int slot = entry->port_change_head % MAC_SPOOF_MAX_EVENTS;
+    entry->port_change_times[slot] = now_us;
+    entry->port_change_head = (entry->port_change_head + 1) % MAC_SPOOF_MAX_EVENTS;
+    if (entry->port_change_count < MAC_SPOOF_MAX_EVENTS)
+        entry->port_change_count++;
+
+    /* Count how many events are within the sliding window */
+    int recent = mac_count_events_in_window(entry, now_us);
+
+    LOG_D("L2", "MAC %s port_changes_in_window=%d threshold=%d",
+          entry->mac, recent, MAC_SPOOF_THRESHOLD);
+
+    /* If threshold crossed and we haven't alerted yet, fire the anomaly */
+    if (recent >= MAC_SPOOF_THRESHOLD && !entry->spoof_alerted) {
+        entry->spoof_alerted = 1;
+
+        LOG_W("L2", "MAC SPOOF ATTACK: %s moved %d times in %llu seconds",
+              entry->mac, recent,
+              (unsigned long long)(MAC_SPOOF_WINDOW_US / 1000000ULL));
+
+        l2_report_anomaly(ctx,
+                          L2_ANOMALY_MAC_SPOOF,
+                          new_port,
+                          (uint32_t)recent,  /* reuse pps field for move-count */
+                          entry->mac,
+                          "mac_spoof_sliding_window");
+    }
+
+    /* Reset alert flag if the window cools down — allow re-alerting on new attack */
+    if (recent < MAC_SPOOF_THRESHOLD && entry->spoof_alerted) {
+        entry->spoof_alerted = 0;
+        LOG_I("L2", "MAC %s spoof window cooled down — alert reset", entry->mac);
+    }
+}
+
 /* ── MAC table management ────────────────────────────────────────────── */
 
 void l2_mac_sync(l2_agent_ctx_t *ctx)
@@ -522,16 +583,10 @@ void l2_mac_sync(l2_agent_ctx_t *ctx)
             {
                 if (ctx->mac_table[j].port != raw[i].port)
                 {
-                    LOG_W("L2", "MAC moved: %s %d→%d",
-                          raw[i].mac,
-                          ctx->mac_table[j].port,
-                          raw[i].port);
-                    l2_report_anomaly(ctx,
-                                      L2_ANOMALY_MAC_SPOOF,
-                                      raw[i].port,
-                                      0,
-                                      raw[i].mac,
-                                      "mac_spoof");
+                    LOG_D("L2", "MAC moved: %s %d->%d",
+                          raw[i].mac, ctx->mac_table[j].port, raw[i].port);
+                    /* Sliding window check — only alert after threshold crossings */
+                    mac_check_spoof_window(ctx, &ctx->mac_table[j], raw[i].port, now);
                 }
 
                 ctx->mac_table[j].last_seen_us = now;
