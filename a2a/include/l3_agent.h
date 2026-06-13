@@ -58,6 +58,26 @@ typedef struct {
     uint64_t conv_sum_us;      /* Sum of convergence times */
     uint64_t conv_min_us;      /* Minimum convergence time */
     uint64_t conv_max_us;      /* Maximum convergence time */
+        /* ── Route oscillation tracking ─────────────────────── */
+    struct {
+        char     prefix[48];
+        uint32_t withdraw_count;
+        uint32_t install_count;
+        uint64_t window_start_us;
+        int      oscillating;
+        int      valid;
+    } osc_log[L3_MAX_ROUTES];
+
+    /* ── Blackhole / isolation tracking per route ────────── */
+    struct {
+        uint64_t last_pkt_count;
+        uint32_t zero_intervals;
+        int      blackhole_alerted;
+        int      isolation_alerted;
+    } route_traffic[L3_MAX_ROUTES];
+
+    uint64_t blackhole_check_last_us;
+
 } l3_agent_ctx_t;
 
 /* Lifecycle */

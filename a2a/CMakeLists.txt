@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(a2a_agent C)
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation -O2")
-
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation -O2 -D_GNU_SOURCE")
 find_library(CJSON_LIB cjson REQUIRED)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)

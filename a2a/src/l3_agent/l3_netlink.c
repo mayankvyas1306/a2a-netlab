@@ -1,3 +1,6 @@
+//src/l3_agent/l3_netlink.c
+
+
 /*
  * Real-time Linux routing monitor via RTNETLINK
  *
@@ -25,6 +28,7 @@
 // Forward declarations from l3_agent.c
 void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r);
 void withdraw_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r);
+void l3_track_oscillation(l3_agent_ctx_t *ctx, const char *prefix, int is_install);
 
 static int g_nl_fd = -1;
 static int g_nl_seq = 1;
@@ -232,11 +236,53 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
     if (ndm->ndm_family != AF_INET)
         return;
 
+    /* Handle NUD_FAILED: nexthop went unreachable */
+    if (ndm->ndm_state & NUD_FAILED) {
+        uint32_t fail_ip = 0;
+        struct rtattr *rta_f = (struct rtattr *)((uint8_t *)ndm + sizeof(struct ndmsg));
+        int rta_len_f = (int)NLMSG_PAYLOAD(nlh, sizeof(struct ndmsg));
+        for (; RTA_OK(rta_f, rta_len_f); rta_f = RTA_NEXT(rta_f, rta_len_f)) {
+            if (rta_f->rta_type == NDA_DST && RTA_PAYLOAD(rta_f) == 4) {
+                memcpy(&fail_ip, RTA_DATA(rta_f), 4);
+                break;
+            }
+        }
+        if (fail_ip != 0 && ctx) {
+            char ip_str[INET_ADDRSTRLEN];
+            struct in_addr fa; fa.s_addr = fail_ip;
+            inet_ntop(AF_INET, &fa, ip_str, sizeof(ip_str));
+
+            /* Dedup: ignore repeated NUD_FAILED for same IP within 5s */
+            static char last_nud_failed_ip[INET_ADDRSTRLEN] = {0};
+            static uint64_t last_nud_failed_us = 0;
+            uint64_t nud_now = a2a_now_us();
+            if (strcmp(last_nud_failed_ip, ip_str) == 0 &&
+                (nud_now - last_nud_failed_us) < 5000000ULL) {
+                return;
+            }
+            strncpy(last_nud_failed_ip, ip_str, sizeof(last_nud_failed_ip) - 1);
+            last_nud_failed_us = nud_now;
+
+            LOG_W("NETLINK", "[%s] NUD_FAILED for nexthop %s — degrading routes",
+                  ctx->switch_id, ip_str);
+            for (int i = 0; i < ctx->route_count; i++) {
+                route_entry_t *r = &ctx->routes[i];
+                if (r->state != ROUTE_STATE_ACTIVE) continue;
+                if (strcmp(r->nexthop, ip_str) != 0) continue;
+                r->state = ROUTE_STATE_DEGRADED;
+                r->last_verified_us = a2a_now_us();
+                LOG_W("NETLINK", "[%s] Route %s DEGRADED (nexthop %s NUD_FAILED)",
+                      ctx->switch_id, r->prefix, ip_str);
+                l3_reroute_around(ctx, r->via_switch, -1);
+            }
+        }
+        return;  /* do NOT add failed entry to g_neigh[] */
+    }
+
     if (!(ndm->ndm_state & (NUD_REACHABLE | NUD_STALE |
                             NUD_DELAY | NUD_PROBE |
                             NUD_PERMANENT)))
         return;
-
     uint32_t ip = 0;
     uint8_t mac[6] = {0};
     int has_ip = 0, has_mac = 0;
@@ -419,6 +465,16 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
                               nh_str,
                               r->prefix);
 
+                        /* Restore DEGRADED route to ACTIVE when nexthop recovers */
+                        if (r->state == ROUTE_STATE_DEGRADED) {
+                            r->state = ROUTE_STATE_ACTIVE;
+                            r->last_verified_us = a2a_now_us();
+                            LOG_I("NETLINK",
+                                  "[%s] Route %s restored DEGRADED→ACTIVE "
+                                  "(nexthop %s ARP resolved)",
+                                  ctx->switch_id, r->prefix, nh_str);
+                        }
+
                         install_route_flow(ctx,
                                            r);
                     }
@@ -428,8 +484,19 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
     }
 }
 
-/* ── Public API ──────────────────────────────────────────────────── */
+/* Trigger ARP resolution via Netlink dump (non-blocking, no subprocess) */
+static void l3_netlink_trigger_arp_dump(void)
+{
+    if (g_nl_fd < 0) return;
+    struct ndmsg ndm = {0};
+    ndm.ndm_family = AF_INET;
+    nl_send_request(g_nl_fd, RTM_GETNEIGH,
+                    NLM_F_REQUEST | NLM_F_DUMP,
+                    &ndm, sizeof(ndm));
+    LOG_D("NETLINK", "ARP neighbour dump requested via Netlink");
+}
 
+/* ── Public API ──────────────────────────────────────────────────── */
 int l3_netlink_init(void)
 {
     g_nl_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
@@ -634,14 +701,46 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                 else if (ex->state == ROUTE_STATE_WITHDRAWN) {
                     ex->state = ROUTE_STATE_ACTIVE;
                     ex->metric = r.metric;
+                    strncpy(ex->nexthop, r.nexthop, sizeof(ex->nexthop) - 1);
                     ex->last_verified_us = a2a_now_us();
                     install_route_flow(ctx, ex);
+                    /* Also trigger Netlink ARP dump to ensure nexthop is resolved */
+                    l3_netlink_trigger_arp_dump();
                     LOG_I("NETLINK",
                           "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
                           ctx->switch_id, r.prefix, ifname, r.metric);
+                    /* Purge stale failover entries for this prefix with different ifname */
+                    for (int _pi = ctx->route_count - 1; _pi >= 0; _pi--) {
+                        route_entry_t *_pr = &ctx->routes[_pi];
+                        if (_pr == ex) continue;
+                        if (strcmp(_pr->prefix, r.prefix) == 0 &&
+                            strcmp(_pr->egress_ifname, ifname) != 0) {
+                            withdraw_route_flow(ctx, _pr);
+                            LOG_D("NETLINK", "[%s] Purged stale failover route %s via %s",
+                                  ctx->switch_id, r.prefix, _pr->egress_ifname);
+                            if (_pi < ctx->route_count - 1)
+                                memmove(&ctx->routes[_pi], &ctx->routes[_pi + 1],
+                                        (ctx->route_count - _pi - 1) * sizeof(route_entry_t));
+                            ctx->route_count--;
+                            /* ex pointer may have shifted — find it again */
+                            ex = NULL;
+                            for (int _ei = 0; _ei < ctx->route_count; _ei++) {
+                                if (strcmp(ctx->routes[_ei].prefix, r.prefix) == 0 &&
+                                    strcmp(ctx->routes[_ei].egress_ifname, ifname) == 0) {
+                                    ex = &ctx->routes[_ei];
+                                    break;
+                                }
+                            }
+                            if (!ex) break;
+                        }
+                    }
                 }
-
-                break;            
+    
+                /* Track oscillation only for non-local, non-directly-connected routes.
+                 * Skip routes with metric=0 (directly connected/local subnets) to avoid
+                 * false positives from storm-driven route repairs. */
+                if (r.metric > 0)
+                    l3_track_oscillation(ctx, r.prefix, 1);                break;            
             }
 
             case RTM_DELROUTE:
@@ -751,7 +850,9 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                     }
 
                 }
-
+                if (r.metric > 0){
+                    l3_track_oscillation(ctx, r.prefix, 0);
+                }
                 break;
             }
 
@@ -774,6 +875,13 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
 }
 
 int l3_netlink_fd(void) { return g_nl_fd; }
+
+/* Public wrapper for use from l3_agent.c */
+void l3_netlink_trigger_arp_dump_pub(void)
+{
+    l3_netlink_trigger_arp_dump();
+}
+
 void l3_netlink_close(void)
 {
     if (g_nl_fd >= 0)

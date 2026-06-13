@@ -1,3 +1,5 @@
+//src/main.c
+
 /* A2A Agent entry point (event-driven via OVS/Netlink, no mock triggers). */
 #include <stdio.h>
 #include <stdlib.h>

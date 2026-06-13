@@ -1,3 +1,5 @@
+//src/l2_agent/l2_agent.c
+
 #include "l2_agent.h"
 #include "a2a_event.h"
 #include "a2a_message.h"
@@ -11,6 +13,9 @@
 #include <sys/stat.h>
 #include "ovs_interface.h"
 #include <sys/socket.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <time.h>
 
 /* Forward declarations to avoid circular include with a2a_metrics.h */
 typedef struct a2a_metrics_t a2a_metrics_t;
@@ -63,38 +68,51 @@ static const char *l2_find_interswitch_port(l2_agent_ctx_t *ctx)
     return NULL;
 }
 
-/* Read gateway IP from br0 address dynamically */
+/* Read gateway IP from bridge using native getifaddrs() — no subprocess */
 static int l2_get_br0_gateway(const char *bridge, char *out, size_t outlen)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ip addr show %s | awk '/inet / {split($2,a,\"/\"); print a[1]}'",
-             bridge);
-    FILE *f = popen(cmd, "r");
-    if (!f) return -1;
-    if (fgets(out, outlen, f)) {
-        out[strcspn(out, "\n")] = '\0';
-        pclose(f);
-        return (out[0] != '\0') ? 0 : -1;
+    struct ifaddrs *ifap, *ifa;
+    if (getifaddrs(&ifap) != 0)
+        return -1;
+    int found = 0;
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr)
+            continue;
+        if (strcmp(ifa->ifa_name, bridge) != 0)
+            continue;
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        if (inet_ntop(AF_INET, &sin->sin_addr, out, outlen)) {
+            found = 1;
+            break;
+        }
     }
-    pclose(f);
-    return -1;
+    freeifaddrs(ifap);
+    return found ? 0 : -1;
 }
 
-/* Discover neighbor IP via ARP on inter-switch port */
+/* Discover neighbor IP from kernel ARP table via /proc/net/arp — native, no subprocess */
 static int l2_discover_neighbor_ip(const char *isw_port, char *out, size_t outlen)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ip neigh show dev %s | awk 'NR==1 {print $1}'", isw_port);
-    FILE *f = popen(cmd, "r");
+    FILE *f = fopen("/proc/net/arp", "r");
     if (!f) return -1;
-    if (fgets(out, outlen, f)) {
-        out[strcspn(out, "\n")] = '\0';
-        pclose(f);
-        return (out[0] != '\0') ? 0 : -1;
+    char line[256];
+    /* Skip header */
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    while (fgets(line, sizeof(line), f)) {
+        char ip[64], hw[64], flags[16], mask[64], dev[64];
+        if (sscanf(line, "%63s %*s %15s %63s %63s %63s",
+                   ip, flags, hw, mask, dev) == 5) {
+            if (strcmp(dev, isw_port) == 0 && strcmp(flags, "0x2") == 0) {
+                strncpy(out, ip, outlen - 1);
+                out[outlen - 1] = '\0';
+                fclose(f);
+                return 0;
+            }
+        }
     }
-    pclose(f);
+    fclose(f);
     return -1;
 }
 
@@ -276,15 +294,21 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                         LOG_W("L2", "[%s] Refusing to isolate uplink port %d (%s) — "
                                     "applying rate-limit instead",
                               ctx->switch_id, pl.port, ifname);
+                        
                         /* Downgrade to rate-limit for uplink ports. */
-                        ovs_of_add_meter(ctx->bridge, 2, 10000); /* 10 Mbps cap */
-                        ovs_flow_t fl = {0};
-                        fl.priority = 1;
-                        snprintf(fl.match, sizeof(fl.match), "in_port=%d", pl.port);
-                        snprintf(fl.actions, sizeof(fl.actions), "meter:2,output:normal");
-                        ovs_add_flow(ctx->bridge, &fl);
-                        LOG_W("L2", "Rate limit applied on uplink port %d instead of isolate",
-                              pl.port);
+                        if (!ctx->meter4_installed) {
+                            ovs_of_add_meter(ctx->bridge, 4, 10000, 0);
+                            ctx->meter4_installed = 1;
+                            ovs_flow_t fl = {0};
+                            fl.priority = 1;
+                            snprintf(fl.match, sizeof(fl.match), "in_port=%d", pl.port);
+                            snprintf(fl.actions, sizeof(fl.actions), "meter:4,output:normal");
+                            ovs_add_flow(ctx->bridge, &fl);
+                            LOG_W("L2", "Rate limit applied on uplink port %d instead of isolate",
+                                  pl.port);
+                        } else {
+                            ovs_of_add_meter(ctx->bridge, 4, 10000, 1);
+                        }
                         break;
                     }
                     ovs_set_port_state(ctx->bridge, ifname, 0);
@@ -312,6 +336,7 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                              "priority=500,in_port=%d", pl.port);
                     ovs_del_flow(ctx->bridge, drop_match);
 
+                    ctx->meter4_installed = 0;
                     LOG_I("L2", "Port %d restored", pl.port);
                     break;
                 }          
@@ -324,17 +349,23 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                     if (rate_kbps < 500)  rate_kbps = 500;
                     if (rate_kbps > 50000) rate_kbps = 50000;
                     
-                    ovs_of_add_meter(ctx->bridge, 2, rate_kbps);
-                    ovs_flow_t fl = {0};
-                    fl.priority = 1;
-                    snprintf(fl.match, sizeof(fl.match),
-                             "in_port=%d", pl.port);
-                    snprintf(fl.actions, sizeof(fl.actions),
-                             "meter:2,output:normal");
+                    if (!ctx->meter4_installed) {
+                        ovs_of_add_meter(ctx->bridge, 4, rate_kbps, 0);
+                        ctx->meter4_installed = 1;
+                        ovs_flow_t fl = {0};
+                        fl.priority = 1;
+                        snprintf(fl.match, sizeof(fl.match),
+                                 "in_port=%d", pl.port);
+                        snprintf(fl.actions, sizeof(fl.actions),
+                                 "meter:4,output:normal");
 
-                    ovs_add_flow(ctx->bridge, &fl);
+                        ovs_add_flow(ctx->bridge, &fl);
 
-                    LOG_W("L2", "Rate limit applied on port %d (%u kbps)", pl.port, rate_kbps);                    
+                        LOG_W("L2", "Rate limit applied on port %d (%u kbps)", pl.port, rate_kbps);                    
+                    } else {
+                        /* Meter is already active. Update the rate silently in the background. */
+                        ovs_of_add_meter(ctx->bridge, 4, rate_kbps, 1);
+                    }
                     break;
                 }
 
@@ -426,6 +457,13 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 
         break;
     }
+
+    case MSG_ANOMALY:
+        /* L3 sending route oscillation or anomaly notification — log it */
+        LOG_I("L2", "[%s] L3 anomaly notification from %s: %.*s",
+              ctx->switch_id, msg->src_agent,
+              (int)msg->payload_len, msg->payload);
+        break;
 
     default:
         LOG_W("L2", "[%s] unhandled msg_type=%d from %s",
@@ -521,7 +559,7 @@ static int mac_count_events_in_window(mac_entry_t *entry, uint64_t now_us)
 }
 
 /* Record a port change event and check if threshold is crossed */
-static void mac_check_spoof_window(l2_agent_ctx_t *ctx,
+void mac_check_spoof_window(l2_agent_ctx_t *ctx,
                                    mac_entry_t *entry,
                                    int new_port,
                                    uint64_t now_us)
@@ -555,10 +593,43 @@ static void mac_check_spoof_window(l2_agent_ctx_t *ctx,
                           "mac_spoof_sliding_window");
     }
 
-    /* Reset alert flag if the window cools down — allow re-alerting on new attack */
+    /* Reset alert flag if the window cools down */
     if (recent < MAC_SPOOF_THRESHOLD && entry->spoof_alerted) {
         entry->spoof_alerted = 0;
         LOG_I("L2", "MAC %s spoof window cooled down — alert reset", entry->mac);
+    }
+
+    /* ── MAC FLAP detection (separate path, different thresholds) ── */
+    uint64_t flap_elapsed = now_us - entry->flap_window_start_us;
+    if (flap_elapsed > MAC_FLAP_WINDOW_US) {
+        /* Reset flap window */
+        entry->flap_count = 0;
+        entry->flap_window_start_us = now_us;
+        entry->is_flapping = 0;
+    }
+    entry->flap_count++;
+
+    if (entry->flap_count >= MAC_FLAP_THRESHOLD && !entry->is_flapping) {
+        entry->is_flapping = 1;
+
+        /* Count simultaneously flapping MACs */
+        int flapping_macs = 0;
+        for (int _fi = 0; _fi < ctx->mac_count; _fi++)
+            if (ctx->mac_table[_fi].is_flapping) flapping_macs++;
+
+        if (flapping_macs >= MAC_FLAP_MULTI_MAC) {
+            LOG_W("L2", "[%s] MAC LOOP DETECTED: %d MACs flapping simultaneously",
+                  ctx->switch_id, flapping_macs);
+            l2_report_anomaly(ctx, L2_ANOMALY_MAC_FLAP,
+                              new_port, (uint32_t)flapping_macs,
+                              entry->mac, "mac_flapping_loop_suspected");
+        } else {
+            LOG_W("L2", "[%s] MAC FLAPPING: %s moved %u times in 30s",
+                  ctx->switch_id, entry->mac, entry->flap_count);
+            l2_report_anomaly(ctx, L2_ANOMALY_MAC_FLAP,
+                              new_port, entry->flap_count,
+                              entry->mac, "mac_flapping");
+        }
     }
 }
 
@@ -738,58 +809,189 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
     uint64_t thresh_clear = (uint64_t)STORM_CLEAR_PPS;
 
     /* ───── STORM DETECTED ───── */
-    if (!ps->storm_active && pps >= thresh_active)
     {
-        /* Confirm it's actually broadcast-heavy before raising alarm */
-        if (ps->bcast_drop_pps > 0 || pps >= thresh_active * 3) {
+        /* Trigger storm if:
+         * - Meter drops confirm broadcast saturation, OR
+         * - Raw pps is overwhelmingly high (>3x), OR  
+         * - Flow-stat aggregate confirms this is broadcast traffic (>= thresh) */
+        int bcast_confirmed = (ps->bcast_drop_pps > 0) ||
+                              (pps >= thresh_active * 3) ||
+                              (ctx->aggregate_flood_pps >= thresh_active && pps >= thresh_active);
+        if (bcast_confirmed) {
+            if (!ps->storm_active) {
+                ps->storm_detected_us = now;
+            }
             ps->storm_active = 1;
             ps->current_pps = (uint32_t)pps;
             ctx->storms_detected++;
             /* (Rest of block continues as normal below this) */
 
-        LOG_W("L2", "STORM DETECTED port=%d pps=%lu", ps->port_no, pps);
+            LOG_W("L2", "STORM DETECTED port=%d pps=%lu", ps->port_no, pps);
 
-        if (now - ps->last_event_sent_us > 1000000)
-        {
-            l2_report_anomaly(ctx, L2_ANOMALY_STORM, ps->port_no, (uint32_t)pps, NULL, "storm_detected");
-            ps->last_event_sent_us = now;
-        }
+            if (now - ps->last_event_sent_us > 1000000)
+            {
+                l2_report_anomaly(ctx, L2_ANOMALY_STORM, ps->port_no, (uint32_t)pps, NULL, "storm_detected");
+                ps->last_event_sent_us = now;
+                ps->last_notified_pps = (uint32_t)pps;
+            }
 
-        a2a_event_t ev = {0};
-        ev.type = A2A_EV_ANOMALY;
-        ev.fsm_event = FSM_EVENT_OVS_EVENT;
-        ev.timestamp_us = now;
-        ev.data.ovs.port = ps->port_no;
-        event_queue_push(&ctx->agent->eq, &ev);
+            a2a_event_t ev = {0};
+            ev.type = A2A_EV_ANOMALY;
+            ev.fsm_event = FSM_EVENT_OVS_EVENT;
+            ev.timestamp_us = now;
+            ev.data.ovs.port = ps->port_no;
+            event_queue_push(&ctx->agent->eq, &ev);
         } else {
-            LOG_W("L2", "[%s] Traffic spike port=%d pps=%lu (not broadcast-confirmed)",
-                  ctx->switch_id, ps->port_no, pps);
+            if (pps >= STORM_THRESHOLD_PPS / 2)  /* only log if above noise floor */
+                LOG_D("L2", "[%s] Traffic spike port=%d pps=%lu (not broadcast-confirmed)",
+                      ctx->switch_id, ps->port_no, pps);
         }
     }
     /* ───── STORM CONTINUES ───── */
-    else if (ps->storm_active && pps >= thresh_active)
+    if (ps->storm_active && pps >= thresh_active)
     {
         ps->current_pps = (uint32_t)pps;
-        if (now - ps->last_event_sent_us > 1000000)
+        /* Re-notify only if: 5s elapsed AND pps changed by >25% */
+        uint32_t pps_delta = (pps > ps->last_notified_pps)
+                             ? (uint32_t)(pps - ps->last_notified_pps)
+                             : (uint32_t)(ps->last_notified_pps - pps);
+        int pps_changed = (ps->last_notified_pps == 0) ||
+                          (pps_delta > ps->last_notified_pps / 4);
+        if ((now - ps->last_event_sent_us > 5000000ULL) && pps_changed)
         {
             l2_report_anomaly(ctx, L2_ANOMALY_STORM, ps->port_no, (uint32_t)pps, NULL, "storm_continues");
             ps->last_event_sent_us = now;
+            ps->last_notified_pps = (uint32_t)pps;
         }
     }
     /* ───── STORM CLEARED ───── */
-    else if (ps->storm_active && pps < thresh_clear)
+    /* Only clear if:
+     * 1. pps is below clear threshold
+     * 2. aggregate_flood_pps is EITHER below threshold OR stale (0 means no
+     *    active flow-stat reading, which is fine to clear on)
+     * 3. Minimum 5s has elapsed since first detect (prevents rapid cycling)
+     * 4. Minimum 10s has elapsed since last storm event was sent */
+    else if (ps->storm_active && pps < thresh_clear &&
+             (now - ps->storm_detected_us) > 10000000ULL)  /* min 10s before clearing */
     {
         ps->storm_active = 0;
+        ctx->meter4_installed = 0;
         LOG_I("L2", "Storm CLEARED port=%d", ps->port_no);
 
-        /*
-         * STORM_CLEAR must always be sent — no rate-limit guard.
-         * Suppressing it leaves the meter flow installed permanently.
-         */
         l2_report_anomaly(ctx, L2_ANOMALY_STORM_CLEAR, ps->port_no, 0, NULL, "storm_cleared");
         ps->last_event_sent_us = now;
     }
 }
+
+/* ── Flow-stat based traffic monitoring ─────────────────────────────── */
+
+static void l2_update_traffic_breakdown(l2_agent_ctx_t *ctx)
+{
+    uint64_t now = a2a_now_us();
+    if (now - ctx->flow_stat_last_us < L2_FLOW_STAT_INTERVAL_US)
+        return;
+
+    double elapsed_s = (double)(now - ctx->flow_stat_last_us) / 1e6;
+    if (elapsed_s <= 0.0) elapsed_s = 0.5;
+
+    /* Get all flow stats from OVS */
+    of_flow_stat_t stats[128];
+    int count = 0;
+    if (ovs_of_get_all_flow_stats(ctx->bridge, stats, 128, &count) < 0 || count == 0) {
+        ctx->flow_stat_last_us = now;
+        return;  /* Don't corrupt prev counters on failed/empty read */
+    }
+
+    /* Extract per-type packet counts by priority */
+    uint64_t bcast_pkt = 0, mcast_pkt = 0, arp_pkt = 0;
+    for (int i = 0; i < count; i++) {
+        if (stats[i].priority == 50)
+            bcast_pkt = stats[i].packet_count;
+        else if (stats[i].priority == 45)
+            mcast_pkt = stats[i].packet_count;
+        else if (stats[i].priority == 60)
+            arp_pkt   = stats[i].packet_count;
+    }
+
+    /* Compute rates */
+    uint64_t bcast_delta = (bcast_pkt >= ctx->bcast_pkt_count_prev)
+                           ? bcast_pkt - ctx->bcast_pkt_count_prev : 0;
+    uint64_t mcast_delta = (mcast_pkt >= ctx->mcast_pkt_count_prev)
+                           ? mcast_pkt - ctx->mcast_pkt_count_prev : 0;
+    uint64_t arp_delta   = (arp_pkt   >= ctx->arp_pkt_count_prev)
+                           ? arp_pkt   - ctx->arp_pkt_count_prev   : 0;
+
+    uint32_t bcast_pps = (uint32_t)(bcast_delta / elapsed_s);
+    uint32_t mcast_pps = (uint32_t)(mcast_delta / elapsed_s);
+    uint32_t arp_pps   = (uint32_t)(arp_delta   / elapsed_s);
+
+    ctx->arp_pps = arp_pps;
+
+    /* Get meter drop stats */
+    of_meter_stat_t m1 = {0}, m2 = {0}, m3 = {0};
+    ovs_of_get_meter_stats(ctx->bridge, 1, &m1);
+    ovs_of_get_meter_stats(ctx->bridge, 2, &m2);
+    ovs_of_get_meter_stats(ctx->bridge, 3, &m3);
+
+    /* Update prev counters */
+    ctx->bcast_pkt_count_prev = bcast_pkt;
+    ctx->mcast_pkt_count_prev = mcast_pkt;
+    ctx->arp_pkt_count_prev   = arp_pkt;
+    ctx->bcast_drop_prev      = m1.packet_band_count;
+    ctx->mcast_drop_prev      = m2.packet_band_count;
+    ctx->arp_drop_prev        = m3.packet_band_count;
+    ctx->flow_stat_last_us    = now;
+
+    LOG_D("L2", "[%s] Traffic breakdown: bcast=%u pps mcast=%u pps arp=%u pps",
+          ctx->switch_id, bcast_pps, mcast_pps, arp_pps);
+
+    /* Store aggregate flood rate — picked up by l2_port_poll() per port */
+    ctx->aggregate_flood_pps = (uint32_t)(bcast_pps + mcast_pps);
+
+    /* ARP storm detection */
+    if (!ctx->arp_storm_active && arp_pps > ARP_STORM_THRESHOLD_PPS) {
+        ctx->arp_storm_active = 1;
+        LOG_W("L2", "[%s] ARP STORM DETECTED: %u pps", ctx->switch_id, arp_pps);
+        l2_report_anomaly(ctx, L2_ANOMALY_ARP_STORM, 0, arp_pps,
+                          NULL, "arp_storm_detected");
+    } else if (ctx->arp_storm_active && arp_pps < 100) {
+        ctx->arp_storm_active = 0;
+        LOG_I("L2", "[%s] ARP storm cleared", ctx->switch_id);
+        l2_report_anomaly(ctx, L2_ANOMALY_ARP_STORM, 0, 0,
+                          NULL, "arp_storm_cleared");
+    }
+}
+
+/* ── Unicast flood detection via PACKET_IN counters ─────────────────── */
+
+static void l2_check_unicast_flood(l2_agent_ctx_t *ctx)
+{
+    for (int i = 0; i < ctx->port_count; i++) {
+        port_state_t *ps = &ctx->ports[i];
+        uint32_t pno = (uint32_t)ps->port_no;
+        if (pno >= OF_MAX_PORTS) continue;
+
+        uint32_t count = g_pkt_in_per_port[pno];
+        g_pkt_in_per_port[pno] = 0;
+
+        /* pps = count per 500ms interval × 2 */
+        uint32_t flood_pps = count * 2;
+        ctx->unicast_flood_pps[i] = flood_pps;
+
+        if (flood_pps > UNICAST_FLOOD_THRESHOLD_PPS) {
+            LOG_W("L2", "[%s] UNICAST FLOOD port=%d: %u pps",
+                  ctx->switch_id, ps->port_no, flood_pps);
+            uint64_t now = a2a_now_us();
+            if (now - ps->last_event_sent_us > 2000000ULL) {
+                l2_report_anomaly(ctx, L2_ANOMALY_UNICAST_FLOOD,
+                                  ps->port_no, flood_pps,
+                                  NULL, "unicast_flood");
+                ps->last_event_sent_us = now;
+            }
+        }
+    }
+}
+
 
 /* ── Port polling ────────────────────────────────────────────────────── */
 
@@ -831,13 +1033,19 @@ void l2_port_poll(l2_agent_ctx_t *ctx)
                     /* Step 1: Flush learned MAC flows */
                     ovs_flush_mac(ctx->bridge, NULL);
 
-                    /* Step 2: Restore kernel route */
+                    /* Step 2: Restore kernel route — use replace for atomicity */
                     if (gateway[0] != '\0')
                     {
                         snprintf(cmd, sizeof(cmd),
-                                 "ip route replace default via %s 2>/dev/null",
-                                 gateway);
+                                 "ip route replace default via %s 2>/dev/null && "
+                                 "ip route replace 10.0.0.0/24 dev %s 2>/dev/null",
+                                 gateway, ctx->bridge);
                         (void)system(cmd);
+                    }
+                    /* Small wait for kernel to process route before notifying L3 */
+                    {
+                        struct timespec ts = {0, 50000000}; /* 50ms */
+                        nanosleep(&ts, NULL);
                     }
 
                     /* Notify L3 peers that the uplink is back. */
@@ -934,8 +1142,26 @@ void l2_port_poll(l2_agent_ctx_t *ctx)
 
         ps->bcast_rx_prev = stats.rx_dropped;
 
-        l2_detect_storm(ctx, i, pps);
+        /* Use whichever is higher: per-port rx_pps or aggregate flood rate.
+         * Only apply aggregate flood if this is the UPLINK port (port index 0
+         * after discovery, or identified by 's1c1'-style ifname pattern). */
+        uint64_t effective_pps = pps;
+        int is_uplink = (strstr(ps->ifname, "c1") != NULL ||
+                         strstr(ps->ifname, "c2") != NULL ||
+                         strstr(ps->ifname, "c3") != NULL ||
+                         strstr(ps->ifname, "c4") != NULL);
+        if (is_uplink && ctx->aggregate_flood_pps > effective_pps)
+            effective_pps = ctx->aggregate_flood_pps;
+        l2_detect_storm(ctx, i, effective_pps);
     }
+    /* Reset aggregate flood after each poll pass, but not while storm is active
+     * to avoid premature clear from stale reads between flow-stat intervals */
+    int any_storm = 0;
+    for (int _si = 0; _si < ctx->port_count; _si++) {
+        if (ctx->ports[_si].storm_active) { any_storm = 1; break; }
+    }
+    if (!any_storm)
+        ctx->aggregate_flood_pps = 0;
 }
 
 /* ── tick: main per-cycle work ───────────────────────────────────────── */
@@ -944,26 +1170,75 @@ void l2_agent_tick(l2_agent_ctx_t *ctx)
 {
     uint64_t now = a2a_now_us();
 
-    if (now - ctx->last_ovsdb_sync_us > 2000000ULL) // every 2 sec
-    {
+    /* OVSDB port sync every 2s */
+    if (now - ctx->last_ovsdb_sync_us > 2000000ULL) {
         l2_sync_ports_from_ovsdb(ctx);
         ctx->last_ovsdb_sync_us = now;
     }
 
-    /* Poll ports for storm detection */
-    if (now - ctx->last_poll_us >= L2_POLL_INTERVAL_US)
-    {
-        if (ctx->agent->fsm_state == FSM_STATE_ACTIVE)
-            l2_port_poll(ctx);
+    if (ctx->agent->fsm_state != FSM_STATE_ACTIVE) {
+        ctx->last_poll_us = now;
+        ctx->last_mac_sync_us = now;
+        return;
+    }
+
+    /* Flow-stat based traffic breakdown + ARP storm (every 500ms) */
+    l2_update_traffic_breakdown(ctx);
+
+    /* Unicast flood check via PACKET_IN counters (every 500ms) */
+    l2_check_unicast_flood(ctx);
+
+    /* Link state poll (every 50ms) — link up/down detection only */
+    if (now - ctx->last_poll_us >= L2_POLL_INTERVAL_US) {
+        l2_port_poll(ctx);
         ctx->last_poll_us = now;
     }
 
-    /* Sync MAC table every 2s */
-    if (now - ctx->last_mac_sync_us >= L2_MAC_SYNC_INTERVAL)
-    {
-        if (ctx->agent->fsm_state == FSM_STATE_ACTIVE)
-            l2_mac_sync(ctx);
+    /* MAC sync every 2s */
+    if (now - ctx->last_mac_sync_us >= L2_MAC_SYNC_INTERVAL) {
+        l2_mac_sync(ctx);
         ctx->last_mac_sync_us = now;
+    }
+
+    /* Table stats + FDB overflow check every 5s */
+    if (now - ctx->table_stat_last_us > 5000000ULL) {
+        of_table_stat_t ts = {0};
+        if (ovs_of_get_table_stats(ctx->bridge, &ts) == 0) {
+            ctx->of_active_flow_count = ts.active_count;
+
+            if (ts.active_count > FDB_OVERFLOW_THRESHOLD
+                && !ctx->fdb_overflow_alerted) {
+                ctx->fdb_overflow_alerted = 1;
+                LOG_W("L2", "[%s] FDB OVERFLOW WARNING: %u active flows "
+                      "(threshold=%d)",
+                      ctx->switch_id, ts.active_count, FDB_OVERFLOW_THRESHOLD);
+                l2_report_anomaly(ctx, L2_ANOMALY_FDB_OVERFLOW, 0,
+                                  ts.active_count, NULL, "fdb_overflow_threshold");
+            } else if (ts.active_count < 700) {
+                ctx->fdb_overflow_alerted = 0;
+            }
+
+            uint64_t total_lookups = ts.lookup_count;
+            uint64_t matched = ts.matched_count;
+            if (total_lookups > 0) {
+                uint64_t miss_pct = (total_lookups - matched) * 100 / total_lookups;
+                if (miss_pct > 40)
+                    LOG_W("L2", "[%s] High table miss rate: %lu%% "
+                          "(lookups=%lu matched=%lu)",
+                          ctx->switch_id, miss_pct, total_lookups, matched);
+            }
+        }
+
+        /* Check OFPT_ERROR flag from openflow.c */
+        if (g_fdb_overflow_flag) {
+            g_fdb_overflow_flag = 0;
+            LOG_E("L2", "[%s] TABLE FULL error from OVS (OFPFMFC_TABLE_FULL)!",
+                  ctx->switch_id);
+            l2_report_anomaly(ctx, L2_ANOMALY_FDB_OVERFLOW, 0,
+                              1024, NULL, "fdb_table_full_error");
+        }
+
+        ctx->table_stat_last_us = now;
     }
 }
 
@@ -1261,13 +1536,17 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
             LOG_I("L2", "[%s] OpenFlow connected fd=%d",
                   switch_id, of_fd);
 
-            /* Install broadcast storm meter */
-            if (ovs_of_add_meter(bridge, 1, 1500) == 0)
-            {
-                LOG_I("L2", "[%s] Storm meter installed "
-                      "(1500 kbps ≈ 1000 pps)",
-                      switch_id);
-            }
+            /* meter:1 — broadcast (1500 kbps ≈ 1000 pps) */
+            if (ovs_of_add_meter(bridge, 1, 1500,0) == 0)
+                LOG_I("L2", "[%s] meter:1 broadcast installed", switch_id);
+
+            /* meter:2 — multicast (separate counter from broadcast) */
+            if (ovs_of_add_meter(bridge, 2, 1500,0) == 0)
+                LOG_I("L2", "[%s] meter:2 multicast installed", switch_id);
+
+            /* meter:3 — ARP rate limit (128 kbps) */
+            if (ovs_of_add_meter(bridge, 3, 128,0) == 0)
+                LOG_I("L2", "[%s] meter:3 ARP installed", switch_id);
             else
             {
                 LOG_W("L2", "[%s] Failed to install storm meter — "
@@ -1322,7 +1601,7 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
 
                 snprintf(mcast_fl.actions,
                          sizeof(mcast_fl.actions),
-                         "meter:1,output:normal");
+                         "meter:2,output:normal");
 
                 if (ovs_add_flow(bridge, &mcast_fl) == 0)
                 {
@@ -1339,7 +1618,23 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
                           switch_id);
                 }
             }
-
+            /* ARP monitoring flow: priority=60, meter:3 */
+            {
+                ovs_flow_t arp_fl = {0};
+                arp_fl.priority     = 60;
+                arp_fl.idle_timeout = 0;
+                arp_fl.hard_timeout = 0;
+                snprintf(arp_fl.match, sizeof(arp_fl.match),
+                         "dl_type=0x0806");
+                snprintf(arp_fl.actions, sizeof(arp_fl.actions),
+                         "meter:3,output:normal");
+                if (ovs_add_flow(bridge, &arp_fl) == 0) {
+                    ctx->flows_installed++;
+                    LOG_I("L2", "[%s] ARP monitoring flow installed "
+                          "(priority=60, meter:3)",
+                          switch_id);
+                }
+            }
             /* No catch-all forwarding flow is installed here.
              *
              * Unknown destination MAC packets must hit the
@@ -1398,7 +1693,7 @@ l2_agent_ctx_t *l2_agent_create(const char *agent_id,
           switch_id, bridge, host, port,
           ctx->port_count,
           use_mock_ovs ? "mock" : "real");
-
+    ovs_of_set_l2_ctx(ctx);
     return ctx;
 }
 
@@ -1460,8 +1755,7 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
      * Idempotency guard — prevents double execution when both OVSDB
      * monitor and l2_port_poll() detect the same link-down event.
      * Once alternate_active=1 is set, any subsequent call for the
-     * same port is a no-op. This is the authoritative guard; the
-     * link_down_reported flag in the callers is best-effort.
+     * same port is a no-op
      */
     for (int _i = 0; _i < ctx->port_count; _i++)
     {
@@ -1555,7 +1849,7 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
                   ctx->switch_id, port, isw_port, isw_ofport);
 
             if (neighbor[0] != '\0') {
-                /* Step 2: Kernel route redirect for sw1's own traffic */
+                /* Step 2: Kernel route redirect for sw's own traffic */
                 char cmd[256];
                 snprintf(cmd, sizeof(cmd),
                          "ip route replace default via %s 2>/dev/null",

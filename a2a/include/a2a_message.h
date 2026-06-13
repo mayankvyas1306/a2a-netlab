@@ -105,19 +105,20 @@ typedef enum {
     MSG_PONG          = 2,
     MSG_REGISTER      = 3,
     MSG_REGISTER_ACK  = 4,
-    MSG_HEARTBEAT     = 5, 
-     MSG_PEER_LIST    = 6,  
+    MSG_HEARTBEAT     = 5,
+    MSG_PEER_LIST     = 6,
     MSG_L2_EVENT      = 10,
     MSG_L3_EVENT      = 11,
     MSG_FLOW_INSTALL  = 20,
     MSG_FLOW_DELETE   = 21,
     MSG_TOPOLOGY      = 30,
-    MSG_ANOMALY       = 31,  
+    MSG_ANOMALY       = 31,
     MSG_ERROR         = 99,
-    MSG_L2_ANOMALY   = 40,
-    MSG_POLICY_CMD   = 41,
-   
+    MSG_L2_ANOMALY    = 40,
+    MSG_POLICY_CMD    = 41,
+    MSG_L3_ANOMALY    = 42
 } a2a_msg_type_t;
+
 
 typedef struct {
     uint32_t        msg_id;
@@ -131,13 +132,24 @@ typedef struct {
 
 /* L2 anomaly types */
 typedef enum {
-    L2_ANOMALY_STORM = 1,
-    L2_ANOMALY_FLOOD = 2,
-    L2_ANOMALY_MAC_SPOOF = 3,
-    L2_ANOMALY_LINK_DOWN = 4,
-    L2_ANOMALY_STORM_CLEAR = 5,
-    L2_ANOMALY_LINK_UP     = 6
+    L2_ANOMALY_STORM        = 1,
+    L2_ANOMALY_FLOOD        = 2,
+    L2_ANOMALY_MAC_SPOOF    = 3,
+    L2_ANOMALY_LINK_DOWN    = 4,
+    L2_ANOMALY_STORM_CLEAR  = 5,
+    L2_ANOMALY_LINK_UP      = 6,
+    L2_ANOMALY_ARP_STORM    = 7,
+    L2_ANOMALY_MAC_FLAP     = 8,
+    L2_ANOMALY_FDB_OVERFLOW = 9,
+    L2_ANOMALY_UNICAST_FLOOD = 10
 } l2_anomaly_type_t;
+
+typedef enum {
+    L3_ANOMALY_BLACKHOLE   = 1,
+    L3_ANOMALY_OSCILLATION = 2,
+    L3_ANOMALY_ISOLATED    = 3
+} l3_anomaly_type_t;
+
 
 
 /* Serialize typed payload into msg->payload (JSON) */
