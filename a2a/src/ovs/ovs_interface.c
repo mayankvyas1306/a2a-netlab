@@ -1,3 +1,5 @@
+//src/ovs/ovs_interface.c
+
 /*
  * OVS backend abstraction layer
  *
@@ -22,6 +24,11 @@ extern int ovs_of_del_flow(const char *bridge, const char *match);
 extern int ovs_of_list_flows(const char *bridge, ovs_flow_t *out, int max);
 extern int ovs_of_flush_mac(const char *bridge);
 extern int ovsdb_set_admin_state(int ovsdb_fd, const char *ifname, int up);
+extern int ovs_of_get_all_flow_stats(const char *bridge, of_flow_stat_t *out,
+                                      int max, int *count_out);
+extern int ovs_of_get_meter_stats(const char *bridge, uint32_t meter_id,
+                                   of_meter_stat_t *out);
+extern int ovs_of_get_table_stats(const char *bridge, of_table_stat_t *out);
 
 static int g_ovsdb_fd = -1;
 
@@ -91,6 +98,15 @@ int ovs_list_flows(const char *bridge, ovs_flow_t *out, int max)
     }
     return ovs_of_list_flows(bridge, out, max);
 }
+
+extern int ovs_of_get_all_flow_stats(const char *bridge,
+                                      of_flow_stat_t *out, int max,
+                                      int *count_out);
+extern int ovs_of_get_meter_stats(const char *bridge,
+                                   uint32_t meter_id,
+                                   of_meter_stat_t *out);
+extern int ovs_of_get_table_stats(const char *bridge,
+                                   of_table_stat_t *out);
 
 /* ── MAC / FDB ───────────────────────────────────────────────────── */
 

@@ -1,3 +1,5 @@
+//src/ovs/ovs_ovsdb.c
+
 /*
  * OVSDB JSON-RPC monitor
  *
@@ -550,5 +552,100 @@ int ovsdb_set_admin_state(int ovsdb_fd, const char *ifname, int up)
           ifname, up ? "up" : "down",
           req_id, ovsdb_fd);
 
+    return 0;
+}
+
+/* ── OVSDB Interface statistics (per-port native read) ──────────── */
+
+int ovs_ovsdb_get_interface_stats(const char *bridge,
+                                  const char *ifname,
+                                  ovsdb_if_stats_t *out)
+{
+    (void)bridge; /* OVSDB socket is global, bridge param reserved */
+    memset(out, 0, sizeof(*out));
+
+    int fd = ovsdb_connect();
+    if (fd < 0)
+        return -1;
+
+    /* OVSDB transact: select Interface row by name, get statistics column */
+    char req[512];
+    static unsigned long long req_id = 0x2000;
+    int req_len = snprintf(req, sizeof(req),
+        "{\"id\":%llu,\"method\":\"transact\",\"params\":["
+        "\"Open_vSwitch\","
+        "{\"op\":\"select\",\"table\":\"Interface\","
+        "\"where\":[[\"name\",\"==\",\"%s\"]],"
+        "\"columns\":[\"statistics\"]}]}\n",
+        req_id++, ifname);
+
+    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
+        close(fd);
+        return -1;
+    }
+
+    if (send(fd, req, (size_t)req_len, MSG_NOSIGNAL) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    char buf[8192];
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root)
+        return -1;
+
+    /* Navigate: result[0].rows[0].statistics */
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (!result) { cJSON_Delete(root); return -1; }
+
+    cJSON *r0 = cJSON_GetArrayItem(result, 0);
+    if (!r0)    { cJSON_Delete(root); return -1; }
+
+    cJSON *rows = cJSON_GetObjectItem(r0, "rows");
+    if (!rows || cJSON_GetArraySize(rows) == 0) {
+        cJSON_Delete(root); return -1;
+    }
+
+    cJSON *row   = cJSON_GetArrayItem(rows, 0);
+    cJSON *stats = cJSON_GetObjectItem(row, "statistics");
+    if (!stats)  { cJSON_Delete(root); return -1; }
+
+    /* OVSDB map: ["map", [["key", val], ...]] */
+    cJSON *pairs = NULL;
+    if (cJSON_IsArray(stats) && cJSON_GetArraySize(stats) == 2)
+        pairs = cJSON_GetArrayItem(stats, 1);
+    else
+        pairs = stats; /* already the array of pairs */
+
+    if (!pairs) { cJSON_Delete(root); return -1; }
+
+    int np = cJSON_GetArraySize(pairs);
+    for (int i = 0; i < np; i++) {
+        cJSON *pair = cJSON_GetArrayItem(pairs, i);
+        if (!pair || cJSON_GetArraySize(pair) < 2) continue;
+        cJSON *kitem = cJSON_GetArrayItem(pair, 0);
+        cJSON *vitem = cJSON_GetArrayItem(pair, 1);
+        if (!kitem || !vitem) continue;
+        const char *key = cJSON_IsString(kitem) ? kitem->valuestring : NULL;
+        long long   val = (long long)vitem->valuedouble;
+        if (!key) continue;
+
+        if      (strcmp(key, "rx_packets") == 0) out->rx_packets = val;
+        else if (strcmp(key, "tx_packets") == 0) out->tx_packets = val;
+        else if (strcmp(key, "rx_bytes")   == 0) out->rx_bytes   = val;
+        else if (strcmp(key, "tx_bytes")   == 0) out->tx_bytes   = val;
+        else if (strcmp(key, "rx_errors")  == 0) out->rx_errors  = val;
+        else if (strcmp(key, "tx_errors")  == 0) out->tx_errors  = val;
+        else if (strcmp(key, "rx_dropped") == 0) out->rx_dropped = val;
+        else if (strcmp(key, "tx_dropped") == 0) out->tx_dropped = val;
+    }
+
+    cJSON_Delete(root);
     return 0;
 }

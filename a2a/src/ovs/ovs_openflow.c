@@ -1,3 +1,5 @@
+//src/ovs/ovs_openflow.c
+
 /*
  * Native OpenFlow 1.3 integration
  *
@@ -13,11 +15,15 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <net/ethernet.h>
+#include <endian.h>
+#include "l2_agent.h"
 
 #include "ovs_interface.h"
 #include "a2a_log.h"
@@ -78,6 +84,7 @@ static int of_install_table_miss(int fd, const char *bridge);
 
 /* Meter constants */
 #define OFPMC_ADD 0
+#define OFPMC_MODIFY 1
 #define OFPMF_KBPS 1
 #define OFPMBT_DROP 1
 
@@ -185,6 +192,13 @@ typedef struct
 
 static of_mac_entry_t g_mac_table[OF_MAC_TABLE_MAX];
 static int g_mac_count = 0;
+
+/* Shared globals — read by L2 agent tick */
+uint32_t g_pkt_in_per_port[OF_MAX_PORTS] = {0};
+volatile int g_fdb_overflow_flag = 0;
+/* Set by main.c or l2_agent.c after agent creation */
+static l2_agent_ctx_t *g_l2_ctx_for_spoof = NULL;
+void ovs_of_set_l2_ctx(void *ctx) { g_l2_ctx_for_spoof = (l2_agent_ctx_t *)ctx; }
 
 /* ── Connection management ───────────────────────────────────────── */
 
@@ -514,7 +528,7 @@ static int build_flow_mod(const ovs_flow_t *flow, uint8_t command,
     off += sizeof(ofp_flow_mod_t);
     fm->header.version = OFP13_VERSION;
     fm->header.type = OFPT_FLOW_MOD;
-    fm->cookie = 0;
+    fm->cookie = htobe64(flow->cookie);
     fm->cookie_mask = 0;
     fm->table_id = 0;
     fm->command = command;
@@ -824,7 +838,7 @@ static int of_reconnect(const char *bridge)
  * Must be called before installing a "meter:N,output:normal" flow.
  */
 int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
-                     uint32_t rate_kbps)
+                     uint32_t rate_kbps, int already_exists)
 {
     int fd = ovs_of_connect(bridge);
     if (fd < 0)
@@ -840,6 +854,43 @@ int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
     memcpy(buf + 4, &xid, 4);
     off = 8;
 
+    /* OVS kernel datapath does not support METER_MOD MODIFY.
+    * Delete existing meter first, then re-add with new rate. */
+    if (already_exists) {
+        /* Send METER_MOD DELETE */
+        uint8_t del_buf[32] = {0};
+        del_buf[0] = OFP13_VERSION;
+        del_buf[1] = OFPT_METER_MOD;
+        uint16_t del_len = htons(16);
+        memcpy(del_buf + 2, &del_len, 2);
+        uint32_t del_xid = htonl(g_xid++);
+        memcpy(del_buf + 4, &del_xid, 4);
+        uint16_t del_cmd = htons(2); /* OFPMC_DELETE */
+        uint16_t del_flags = htons(0);
+        memcpy(del_buf + 8,  &del_cmd,   2);
+        memcpy(del_buf + 10, &del_flags, 2);
+        uint32_t del_mid = htonl(meter_id);
+        memcpy(del_buf + 12, &del_mid, 4);
+        send(fd, del_buf, 16, MSG_NOSIGNAL);
+
+        /* Wait up to 100ms for OVS kernel datapath to process the DELETE.
+         * Poll in 10ms increments; drain any pending messages (ECHO_REQUEST
+         * or stale OFPT_ERROR from prior ADD) so the socket buffer is clean. */
+        struct timeval tv_save = {0, 0};
+        socklen_t tv_len = sizeof(tv_save);
+        getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_save, &tv_len);
+        struct timeval tv_poll = {0, 10000}; /* 10ms */
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_poll, sizeof(tv_poll));
+        for (int _wi = 0; _wi < 10; _wi++) {
+            uint8_t drain[64];
+            ssize_t n = recv(fd, drain, sizeof(drain), 0);
+            if (n <= 0) break; /* no more pending messages */
+        }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_save, sizeof(tv_save));
+        /* Additional 50ms guard to let kernel complete deletion */
+        struct timespec ts = {0, 50000000}; /* 50ms */
+        nanosleep(&ts, NULL);
+    }
     uint16_t cmd = htons(OFPMC_ADD);
     uint16_t flags = htons(OFPMF_KBPS);
     memcpy(buf + off, &cmd, 2);
@@ -875,6 +926,226 @@ int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
     }
     LOG_I("OF", "[%s] Meter %u installed rate=%u kbps",
           bridge, meter_id, rate_kbps);
+    return 0;
+}
+
+/* ── OpenFlow statistics API ─────────────────────────────────────── */
+
+int ovs_of_get_all_flow_stats(const char *bridge,
+                               of_flow_stat_t *out, int max,
+                               int *count_out)
+{
+    *count_out = 0;
+    of_conn_t *c = of_get_conn(bridge);
+    if (!c || c->fd < 0) return -1;
+
+    /* Build OFPMP_FLOW request — 56 bytes */
+    uint8_t req[56] = {0};
+    req[0] = OFP13_VERSION;
+    req[1] = 18;  /* OFPT_MULTIPART_REQUEST */
+    uint16_t rlen = htons(56);
+    memcpy(req + 2, &rlen, 2);
+    uint32_t xid = htonl(g_xid++);
+    memcpy(req + 4, &xid, 4);
+    /* OFPMP_FLOW = 1 */
+    uint16_t mp_type = htons(1);
+    memcpy(req + 8, &mp_type, 2);
+    /* body: table_id=OFPTT_ALL at offset 16 */
+    req[16] = 0xFF;
+    /* out_port=OFPP_ANY */
+    memset(req + 20, 0xFF, 4);
+    /* out_group=OFPG_ANY */
+    memset(req + 24, 0xFF, 4);
+    /* match: OXM empty at offset 48 */
+    uint16_t mt = htons(1);
+    memcpy(req + 48, &mt, 2);
+    uint16_t ml = htons(4);
+    memcpy(req + 50, &ml, 2);
+
+    if (send(c->fd, req, 56, MSG_NOSIGNAL) < 0) {
+        LOG_E("OF", "[%s] flow stats request send failed errno=%d", bridge, errno);
+        return -1;
+    }
+
+    /* Temporarily set 300ms recv timeout */
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t reply[16384];
+    int total = 0;
+
+    for (;;) {
+        ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+        if (n <= 0) break;
+
+        ofp_header_t *hdr = (ofp_header_t *)reply;
+        /* Skip ECHO_REQUEST (type=2) and PACKET_IN (type=10): service them inline */
+        if (hdr->type == 2) {  /* OFPT_ECHO_REQUEST */
+            ofp_header_t echo_reply = *hdr;
+            echo_reply.type = 3;  /* OFPT_ECHO_REPLY */
+            send(c->fd, &echo_reply, sizeof(echo_reply), MSG_NOSIGNAL);
+            continue;  /* keep waiting for stats reply */
+        }
+        if (hdr->type != 19) continue;  /* skip non-multipart, keep waiting */
+
+        uint16_t reply_mp_type;
+        memcpy(&reply_mp_type, reply + 8, 2);
+        if (ntohs(reply_mp_type) != 1) continue;  /* not OFPMP_FLOW, skip */
+
+        /* Parse flow entries starting at offset 16 */
+        int off = 16;
+        while (off + 56 <= (int)n && total < max) {
+            uint16_t entry_len;
+            memcpy(&entry_len, reply + off, 2);
+            entry_len = ntohs(entry_len);
+            if (entry_len < 56 || (off + entry_len) > (int)n)
+                break;
+
+            of_flow_stat_t *s = &out[total];
+
+            /* duration_sec at +4 */
+            uint32_t dur; memcpy(&dur, reply + off + 4, 4);
+            s->duration_sec = ntohl(dur);
+
+            /* cookie at +8 */
+            uint64_t ck; memcpy(&ck, reply + off + 8, 8);
+            s->cookie = be64toh(ck);
+
+            /* priority at +12 */
+            uint16_t pri; memcpy(&pri, reply + off + 12, 2);
+            s->priority = ntohs(pri);
+
+            /* packet_count at +32 */
+            uint64_t pc; memcpy(&pc, reply + off + 32, 8);
+            s->packet_count = be64toh(pc);
+
+            /* byte_count at +40 */
+            uint64_t bc; memcpy(&bc, reply + off + 40, 8);
+            s->byte_count = be64toh(bc);
+
+            total++;
+            off += entry_len;
+        }
+
+        /* Check OFPMP more-replies flag (bit 0 at offset 10) */
+        uint16_t flags; memcpy(&flags, reply + 10, 2);
+        if (!(ntohs(flags) & 0x0001)) break;
+    }
+
+    /* Restore non-blocking */
+    tv.tv_sec = 0; tv.tv_usec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    *count_out = total;
+    LOG_D("OF", "[%s] flow stats: %d entries", bridge, total);
+    return 0;
+}
+
+int ovs_of_get_meter_stats(const char *bridge,
+                            uint32_t meter_id,
+                            of_meter_stat_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->meter_id = meter_id;
+
+    of_conn_t *c = of_get_conn(bridge);
+    if (!c || c->fd < 0) return -1;
+
+    /* OFPMP_METER = 9, request is 24 bytes */
+    uint8_t req[24] = {0};
+    req[0] = OFP13_VERSION;
+    req[1] = 18;
+    uint16_t rlen = htons(24);
+    memcpy(req + 2, &rlen, 2);
+    uint32_t xid = htonl(g_xid++);
+    memcpy(req + 4, &xid, 4);
+    uint16_t mpt = htons(9);
+    memcpy(req + 8, &mpt, 2);
+    uint32_t mid = htonl(meter_id);
+    memcpy(req + 16, &mid, 4);
+
+    if (send(c->fd, req, 24, MSG_NOSIGNAL) < 0) return -1;
+
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t reply[512] = {0};
+    ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+
+    tv.tv_usec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (n < 56) return -1;
+
+    /* ofp_meter_stats layout after 16-byte multipart reply header:
+     * [0] meter_id(4) [4] len(2) [6] pad(6)
+     * [12] flow_count(4) [16] packet_in_count(8) [24] byte_in_count(8)
+     * [32] duration_sec(4) [36] duration_nsec(4)
+     * [40] band_stats[0]: packet_band_count(8) [48] byte_band_count(8) */
+    int base = 16;
+    if (n < base + 56) return -1;
+
+    uint64_t pic; memcpy(&pic, reply + base + 16, 8);
+    out->packet_in_count = be64toh(pic);
+
+    uint64_t bic; memcpy(&bic, reply + base + 24, 8);
+    out->byte_in_count = be64toh(bic);
+
+    if (n >= base + 56) {
+        uint64_t pbc; memcpy(&pbc, reply + base + 40, 8);
+        out->packet_band_count = be64toh(pbc);
+
+        uint64_t bbc; memcpy(&bbc, reply + base + 48, 8);
+        out->byte_band_count = be64toh(bbc);
+    }
+    return 0;
+}
+
+int ovs_of_get_table_stats(const char *bridge,
+                            of_table_stat_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    of_conn_t *c = of_get_conn(bridge);
+    if (!c || c->fd < 0) return -1;
+
+    /* OFPMP_TABLE = 3, request is 16 bytes (header only) */
+    uint8_t req[16] = {0};
+    req[0] = OFP13_VERSION;
+    req[1] = 18;
+    uint16_t rlen = htons(16);
+    memcpy(req + 2, &rlen, 2);
+    uint32_t xid = htonl(g_xid++);
+    memcpy(req + 4, &xid, 4);
+    uint16_t mpt = htons(3);
+    memcpy(req + 8, &mpt, 2);
+
+    if (send(c->fd, req, 16, MSG_NOSIGNAL) < 0) return -1;
+
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t reply[512] = {0};
+    ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+
+    tv.tv_usec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* ofp_table_stats after 16-byte header:
+     * [0] table_id(1) [1] pad(3)
+     * [4] active_count(4) [8] lookup_count(8) [16] matched_count(8) */
+    if (n < 16 + 24) return -1;
+
+    int base = 16;
+    uint32_t ac; memcpy(&ac, reply + base + 4, 4);
+    out->active_count = ntohl(ac);
+
+    uint64_t lc; memcpy(&lc, reply + base + 8, 8);
+    out->lookup_count = be64toh(lc);
+
+    uint64_t mc; memcpy(&mc, reply + base + 16, 8);
+    out->matched_count = be64toh(mc);
+
     return 0;
 }
 
@@ -1060,7 +1331,7 @@ int ovs_of_flush_mac(const char *bridge)
         ovs_of_add_flow(bridge, &bcast_fl);
     }
 
-    /* Multicast storm protection: priority=45 */
+    /* Multicast storm protection: priority=45, meter:2 */
     {
         ovs_flow_t mcast_fl = {0};
         mcast_fl.priority     = 45;
@@ -1069,11 +1340,23 @@ int ovs_of_flush_mac(const char *bridge)
         snprintf(mcast_fl.match, sizeof(mcast_fl.match),
                  "dl_dst=01:00:00:00:00:00/01:00:00:00:00:00");
         snprintf(mcast_fl.actions, sizeof(mcast_fl.actions),
-                 "meter:1,output:normal");
+                 "meter:2,output:normal");
         ovs_of_add_flow(bridge, &mcast_fl);
     }
 
-    LOG_I("OF", "[%s] flush_mac: permanent flows reinstalled (table-miss, bcast, mcast)",
+    /* ARP monitoring flow: priority=60, meter:3 */
+    {
+        ovs_flow_t arp_fl = {0};
+        arp_fl.priority     = 60;
+        arp_fl.idle_timeout = 0;
+        arp_fl.hard_timeout = 0;
+        snprintf(arp_fl.match, sizeof(arp_fl.match), "dl_type=0x0806");
+        snprintf(arp_fl.actions, sizeof(arp_fl.actions),
+                 "meter:3,output:normal");
+        ovs_of_add_flow(bridge, &arp_fl);
+    }
+
+    LOG_I("OF", "[%s] flush_mac: permanent flows reinstalled (table-miss, bcast, mcast, arp)",
           bridge);
     return 0;
 }
@@ -1111,6 +1394,22 @@ static void mac_table_learn(const uint8_t *eth_src, uint32_t in_port,
                 LOG_I("OF", "[%s] MAC moved: %s %u → %u",
                       bridge, mac_str, g_mac_table[i].in_port, in_port);
                 g_mac_table[i].in_port = in_port;
+                if (in_port < OF_MAX_PORTS)
+                    g_pkt_in_per_port[in_port]++;
+
+                /* Spoof/flap detection directly in PACKET_IN path */
+                if (g_l2_ctx_for_spoof) {
+                    uint64_t now_us = a2a_now_us();
+                    for (int _si = 0; _si < g_l2_ctx_for_spoof->mac_count; _si++) {
+                        mac_entry_t *me = &g_l2_ctx_for_spoof->mac_table[_si];
+                        if (strncmp(me->mac, mac_str, 17) == 0) {
+                            mac_check_spoof_window(g_l2_ctx_for_spoof, me,
+                                                   (int)in_port, now_us);
+                            me->port = (int)in_port;
+                            break;
+                        }
+                    }
+                }
 
                 ovs_flow_t fwd = {0};
                 fwd.priority = 10;
@@ -1136,6 +1435,33 @@ static void mac_table_learn(const uint8_t *eth_src, uint32_t in_port,
     e->valid = 1;
 
     LOG_I("OF", "[%s] MAC learned: %s port=%u", bridge, mac_str, in_port);
+
+    /* Increment per-port PACKET_IN counter for unicast flood detection */
+    if (in_port < OF_MAX_PORTS)
+        g_pkt_in_per_port[in_port]++;
+
+    /* Eagerly create entry in L2 ctx MAC table so port-change spoof check works
+     * immediately, without waiting 2s for l2_mac_sync() to run. */
+    if (g_l2_ctx_for_spoof && g_l2_ctx_for_spoof->mac_count < L2_MAX_MAC_TABLE) {
+        /* Check not already there (shouldn't be, but guard against race) */
+        int already = 0;
+        for (int _ci = 0; _ci < g_l2_ctx_for_spoof->mac_count; _ci++) {
+            if (strncmp(g_l2_ctx_for_spoof->mac_table[_ci].mac, mac_str, 17) == 0) {
+                already = 1;
+                break;
+            }
+        }
+        if (!already) {
+            mac_entry_t *ce = &g_l2_ctx_for_spoof->mac_table[g_l2_ctx_for_spoof->mac_count++];
+            strncpy(ce->mac, mac_str, sizeof(ce->mac) - 1);
+            ce->mac[17] = '\0';
+            ce->port = (int)in_port;
+            ce->learned_at_us = now;
+            ce->last_seen_us  = now;
+            ce->pkt_count = 1;
+            ce->flap_window_start_us = now;
+        }
+    }
 
     ovs_flow_t fwd = {0};
     fwd.priority = 10;
@@ -1248,6 +1574,28 @@ void ovs_of_process_packet_in(const char *bridge, int fd)
             reply.length = htons(8);
             reply.xid = msg_hdr->xid;
             send(fd, &reply, sizeof(reply), MSG_NOSIGNAL);
+            free(buf);
+            continue;
+        }
+
+        /* OFPT_ERROR = type 1 */
+        if (msg_hdr->type == 1 && total_len >= 12)
+        {
+            uint16_t err_type, err_code;
+            memcpy(&err_type, buf + 8,  2); err_type = ntohs(err_type);
+            memcpy(&err_code, buf + 10, 2); err_code = ntohs(err_code);
+            
+            /* OFPET_METER_MOD_FAILED=12, OFPMMFC_METER_EXISTS=1 */
+            if (err_type == 12 && err_code == 1) {
+                /* Harmless race condition during rapid storm mitigation. Suppress it. */
+            }
+            /* OFPET_FLOW_MOD_FAILED=5, OFPFMFC_TABLE_FULL=1 */
+            else if (err_type == 5 && err_code == 1) {
+                LOG_E("OF", "[%s] OFPT_ERROR: FLOW TABLE FULL — FDB overflow!", bridge);
+                g_fdb_overflow_flag = 1;
+            } else {
+                LOG_W("OF", "[%s] OFPT_ERROR type=%u code=%u", bridge, err_type, err_code);
+            }
             free(buf);
             continue;
         }

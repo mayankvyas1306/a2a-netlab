@@ -1,4 +1,7 @@
+//src/l3_agent/l3_agent.c
+
 #include "l3_agent.h"
+#include "l2_agent.h"
 #include "a2a_event.h"
 #include "a2a_message.h"
 #include "a2a_heartbeat.h"
@@ -20,9 +23,11 @@ void ovsdb_process_update(const char *json, a2a_agent_t *agent);
 extern int ovsdb_get_ofport(const char *ifname);
 extern int ovs_of_connect(const char *bridge);
 extern void ovs_set_ovsdb_fd(int fd);
+void l3_netlink_trigger_arp_dump_pub(void);
 
 int ovsdb_connect(void);
 int ovsdb_send_monitor(int fd);
+void l3_track_oscillation(l3_agent_ctx_t *ctx, const char *prefix, int is_install);
 
 /* ── Internal helpers ────────────────────────────────────────────────── */
 
@@ -110,12 +115,14 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
              * This is identical to how Linux bridges work: packets
              * addressed to the bridge are passed up to the IP stack.
              */
+           
             ovs_flow_t fl = {0};
-            fl.priority    = 100;
+            fl.priority = 100;
+            fl.cookie   = (uint64_t)(r - ctx->routes);  /* route array index as identity */
+            snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
             fl.idle_timeout = 0;
             fl.hard_timeout = 0;
-            snprintf(fl.match, sizeof(fl.match),
-                     "ip,nw_dst=%s", r->prefix);
+            
             snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
             ovs_add_flow(ctx->bridge, &fl);
             LOG_I("L3",
@@ -137,6 +144,7 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
 
     ovs_flow_t fl = {0};
     fl.priority = 100;
+    fl.cookie   = (uint64_t)(r - ctx->routes);  /* route array index as identity */
     snprintf(fl.match, sizeof(fl.match), "ip,nw_dst=%s", r->prefix);
 
     /* Only rewrite MACs if we have a valid OVS port and ARP resolution */
@@ -157,8 +165,11 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
         // handle_neigh() will reinstall this flow once ARP resolves.
         if (strcmp(r->nexthop, "0.0.0.0") == 0)
         {
+            /* Use priority=90 for direct-connected catch-all so per-prefix
+             * flows at priority=100 can match and count packets correctly. */
+            fl.priority = 90;
             snprintf(fl.actions, sizeof(fl.actions), "output:NORMAL");
-            LOG_I("L3", "[%s] Direct-connected route %s — installing NORMAL (ARP handled by kernel)",
+            LOG_I("L3", "[%s] Direct-connected route %s — installing NORMAL priority=90 (ARP handled by kernel)",
                   ctx->switch_id, r->prefix);
             ovs_add_flow(ctx->bridge, &fl);
         }
@@ -166,12 +177,9 @@ void install_route_flow(l3_agent_ctx_t *ctx, const route_entry_t *r)
         {
             LOG_I("L3", "[%s] Deferring flow for %s (nexthop %s not ARP-resolved yet)",
                   ctx->switch_id, r->prefix, r->nexthop);
-            // Flow will be installed by handle_neigh() when ARP resolves.
-            // Proactively trigger ARP resolution:
-            char arp_cmd[128];
-            snprintf(arp_cmd, sizeof(arp_cmd), "arping -c 1 -I %s %s >/dev/null 2>&1 &",
-                     r->egress_ifname, r->nexthop);
-            system(arp_cmd);
+            /* Trigger ARP resolution via Netlink dump — no subprocess */
+            extern void l3_netlink_trigger_arp_dump_pub(void);
+            l3_netlink_trigger_arp_dump_pub();
         }
     }
 }
@@ -231,14 +239,55 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
                  const char *nexthop, const char *via_switch, const char *ifname,
                  int metric, int is_local)
 {
+    /* First pass: exact match (prefix + ifname) — update in place */
+    for (int i = 0; i < ctx->route_count; i++) {
+        route_entry_t *existing = &ctx->routes[i];
+        if (strcmp(existing->prefix, prefix) == 0 &&
+            strcmp(existing->egress_ifname, ifname) == 0) {
+            /* Update nexthop/metric and re-activate */
+            strncpy(existing->nexthop, nexthop, sizeof(existing->nexthop) - 1);
+            strncpy(existing->via_switch, via_switch, A2A_MAX_AGENT_ID - 1);
+            existing->metric = metric;
+            existing->state  = ROUTE_STATE_ACTIVE;
+            existing->last_verified_us = a2a_now_us();
+            existing->is_local = is_local;
+            install_route_flow(ctx, existing);
+            ctx->route_installs++;
+            LOG_I("L3", "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
+                  ctx->switch_id, prefix, ifname, metric);
+            /* Only track oscillation for true kernel RTM events, not internal repairs.
+             * The caller sets is_local=1 for kernel-driven reinstalls from RTM_NEWROUTE.
+             * Internal reroutes (storm/link repair) pass is_local=0 but aren't RTM events.
+             * Skip oscillation to prevent false positives from rapid storm handling. */
+            if (existing->state == ROUTE_STATE_WITHDRAWN)
+                l3_track_oscillation(ctx, prefix, 1);
+            notify_l2_peers_topology(ctx, existing, 0);
+            return 0;
+        }
+    }
+    /* Second pass: remove stale entries for same prefix with different ifname.
+     * Do this in reverse to allow safe array compaction. */
+    for (int i = ctx->route_count - 1; i >= 0; i--) {
+        route_entry_t *ex2 = &ctx->routes[i];
+        if (strcmp(ex2->prefix, prefix) == 0 &&
+            strcmp(ex2->egress_ifname, ifname) != 0) {
+            LOG_D("L3", "[%s] Old route %s via %s removed (superseded by %s)",
+                  ctx->switch_id, prefix, ex2->egress_ifname, ifname);
+            /* Compact: shift remaining entries left */
+            if (i < ctx->route_count - 1) {
+                memmove(&ctx->routes[i], &ctx->routes[i + 1],
+                        (ctx->route_count - i - 1) * sizeof(route_entry_t));
+            }
+            ctx->route_count--;
+        }
+    }
     if (ctx->route_count >= L3_MAX_ROUTES)
         return -1;
     route_entry_t *r = &ctx->routes[ctx->route_count++];
     strncpy(r->prefix, prefix, sizeof(r->prefix) - 1);
     strncpy(r->nexthop, nexthop, sizeof(r->nexthop) - 1);
     strncpy(r->via_switch, via_switch, A2A_MAX_AGENT_ID - 1);
-    strncpy(r->egress_ifname, ifname,
-            sizeof(r->egress_ifname) - 1);
+    strncpy(r->egress_ifname, ifname, sizeof(r->egress_ifname) - 1);
     r->metric = metric;
     r->state = ROUTE_STATE_ACTIVE;
     r->installed_at_us = a2a_now_us();
@@ -246,8 +295,24 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
     r->is_local = is_local;
 
     install_route_flow(ctx, r);
-     ctx->route_installs++;  /* Track for metrics */
+    ctx->route_installs++;
     notify_l2_peers_topology(ctx, r, 0);
+
+    /* Final cleanup: remove all OTHER entries for same prefix regardless of state.
+     * The new entry was appended at index (route_count - 1).
+     * Save its index, do NOT use pointer after memmove. */
+    int new_idx = ctx->route_count - 1;
+    for (int _ci = new_idx - 1; _ci >= 0; _ci--) {
+        route_entry_t *_cx = &ctx->routes[_ci];
+        if (strcmp(_cx->prefix, prefix) == 0) {
+            if (_ci < ctx->route_count - 1) {
+                memmove(&ctx->routes[_ci], &ctx->routes[_ci + 1],
+                        (ctx->route_count - _ci - 1) * sizeof(route_entry_t));
+            }
+            ctx->route_count--;
+            new_idx--;  /* new entry shifted left */
+        }
+    }
 
     LOG_I("L3", "[%s] Route installed: %s via %s nh=%s metric=%d",
           ctx->switch_id, prefix, via_switch, nexthop, metric);
@@ -646,7 +711,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         }
         break;
 
-        case L2_ANOMALY_MAC_SPOOF: {
+    case L2_ANOMALY_MAC_SPOOF: {
             a2a_agent_t *agent = ctx->agent;
             /* Build a BLACKHOLE policy command back to the L2 agent */
             policy_cmd_payload_t pcmd = {0};
@@ -676,7 +741,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             }
             LOG_W("L3", "Sent BLACKHOLE_MAC for %s to switch %s", pl.mac, pl.switch_id);
             break;
-        }
+    }
 
     case L2_ANOMALY_LINK_DOWN:
         LOG_I("L3", "Decision: LINK_DOWN → reroute");
@@ -712,17 +777,8 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0 (dynamic)",
                   ctx->switch_id, r->prefix);
                   
-            for (int i = 0; i < ctx->route_count; i++) {
-                if (strcmp(ctx->routes[i].nexthop, "0.0.0.0") != 0 && 
-                    ctx->routes[i].state == ROUTE_STATE_ACTIVE) {
-                    char acmd[256];
-                    snprintf(acmd, sizeof(acmd), 
-                        "arping -c 2 -I %s %s >/dev/null 2>&1 &",
-                        ctx->routes[i].egress_ifname,
-                        ctx->routes[i].nexthop);
-                    system(acmd);
-                }
-            }
+            /* Trigger ARP refresh via Netlink dump — no subprocess */
+            l3_netlink_trigger_arp_dump_pub();
             break;
         }
 
@@ -738,14 +794,239 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         }
         break;
     }
+    case L2_ANOMALY_ARP_STORM:
+        if (pl.pps > 0) {
+            /* ARP storm: rate-limit the port */
+            LOG_I("L3", "Decision: ARP_STORM → rate limit port %d", pl.port);
+            l3_send_policy(ctx, msg->src_agent,
+                           POLICY_RATE_LIMIT, pl.port, NULL, pl.pps * 2);
+        } else {
+            /* Clear: restore */
+            LOG_I("L3", "Decision: ARP_STORM cleared → restore port %d", pl.port);
+            l3_send_policy(ctx, msg->src_agent,
+                           POLICY_RESTORE_PORT, pl.port, NULL, 0);
+        }
+        break;
+
+    case L2_ANOMALY_MAC_FLAP:
+        if (pl.pps >= MAC_FLAP_MULTI_MAC) {
+            /* Loop suspected — do NOT blackhole, just log and notify */
+            LOG_W("L3", "Decision: MAC_FLAP loop suspected on switch %s "
+                  "(%u MACs) — monitoring only",
+                  pl.switch_id, pl.pps);
+        } else {
+            /* Normal flap — mild rate limit */
+            l3_send_policy(ctx, msg->src_agent,
+                           POLICY_RATE_LIMIT, pl.port, NULL, 5000);
+        }
+        break;
+
+    case L2_ANOMALY_FDB_OVERFLOW:
+        LOG_W("L3", "Decision: FDB_OVERFLOW on switch %s — monitoring",
+              pl.switch_id);
+        /* No direct action possible — log for operator awareness */
+        break;
+
+    case L2_ANOMALY_UNICAST_FLOOD:
+        LOG_I("L3", "Decision: UNICAST_FLOOD port %d %u pps → rate limit",
+              pl.port, pl.pps);
+        l3_reroute_around(ctx, pl.switch_id, pl.port);
+        l3_send_policy(ctx, msg->src_agent,
+                       POLICY_RATE_LIMIT, pl.port, NULL, pl.pps * 2);
+        break;
 
     default:
         break;
     }
 }
 
-/* ── FSM action handlers ─────────────────────────────────────────────── */
+/* ── Route oscillation tracking ─────────────────────────────────────── */
 
+#define OSC_WINDOW_US   (60ULL * 1000000ULL)
+#define OSC_THRESHOLD   4
+
+void l3_track_oscillation(l3_agent_ctx_t *ctx,
+                                  const char *prefix, int is_install)
+{
+    uint64_t now = a2a_now_us();
+
+    /* Find or allocate slot */
+    int slot = -1;
+    for (int i = 0; i < L3_MAX_ROUTES; i++) {
+        if (!ctx->osc_log[i].valid) {
+            if (slot < 0) slot = i;
+            continue;
+        }
+        if (strcmp(ctx->osc_log[i].prefix, prefix) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return;  /* no space */
+
+    if (!ctx->osc_log[slot].valid) {
+        strncpy(ctx->osc_log[slot].prefix, prefix,
+                sizeof(ctx->osc_log[slot].prefix) - 1);
+        ctx->osc_log[slot].window_start_us = now;
+        ctx->osc_log[slot].withdraw_count  = 0;
+        ctx->osc_log[slot].install_count   = 0;
+        ctx->osc_log[slot].oscillating     = 0;
+        ctx->osc_log[slot].valid           = 1;
+    }
+
+    /* Reset window if expired */
+    if (now - ctx->osc_log[slot].window_start_us > OSC_WINDOW_US) {
+        ctx->osc_log[slot].withdraw_count = 0;
+        ctx->osc_log[slot].install_count  = 0;
+        ctx->osc_log[slot].window_start_us = now;
+        ctx->osc_log[slot].oscillating    = 0;
+    }
+
+    if (is_install) ctx->osc_log[slot].install_count++;
+    else            ctx->osc_log[slot].withdraw_count++;
+
+    int total = ctx->osc_log[slot].withdraw_count +
+                ctx->osc_log[slot].install_count;
+
+    if (total >= OSC_THRESHOLD && !ctx->osc_log[slot].oscillating) {
+        ctx->osc_log[slot].oscillating = 1;
+
+        LOG_W("L3", "[%s] ROUTE OSCILLATION DETECTED: %s "
+              "(%d withdrawals + %d installs in 60s)",
+              ctx->switch_id, prefix,
+              ctx->osc_log[slot].withdraw_count,
+              ctx->osc_log[slot].install_count);
+
+        /* Send anomaly notification to all peers */
+        a2a_message_t msg = {0};
+        msg.msg_id   = ++ctx->agent->msg_counter;
+        msg.msg_type = MSG_ANOMALY;
+        msg.timestamp_us = now;
+        strncpy(msg.src_agent, ctx->agent->card.agent_id,
+                A2A_MAX_AGENT_ID - 1);
+        snprintf(msg.payload, A2A_MAX_PAYLOAD - 1,
+                 "{\"anomaly_type\":%d,\"prefix\":\"%s\","
+                 "\"switch_id\":\"%s\",\"reason\":\"route_oscillation\","
+                 "\"duration_sec\":%u}",
+                 L3_ANOMALY_OSCILLATION, prefix, ctx->switch_id,
+                 (uint32_t)((now - ctx->osc_log[slot].window_start_us)
+                             / 1000000ULL));
+        msg.payload_len = (uint32_t)strlen(msg.payload);
+
+        for (int i = 0; i < ctx->agent->peer_count; i++) {
+            agent_peer_t *p = &ctx->agent->peers[i];
+            if (!p->alive) continue;
+            strncpy(msg.dst_agent, p->agent_id, A2A_MAX_AGENT_ID - 1);
+            conn_pool_send(&ctx->agent->pool, p->host, p->port, &msg);
+        }
+    }
+}
+
+/* ── Blackhole and subnet isolation detection ────────────────────────── */
+
+#define BLACKHOLE_CHECK_INTERVAL_US  (10ULL * 1000000ULL)
+#define BLACKHOLE_ZERO_INTERVALS      3   /* 3 × 10s = 30s of no traffic */
+#define ISOLATION_ZERO_INTERVALS     12   /* 12 × 10s = 120s never had traffic */
+
+static void l3_detect_blackhole_and_isolation(l3_agent_ctx_t *ctx)
+{
+    uint64_t now = a2a_now_us();
+    if (now - ctx->blackhole_check_last_us < BLACKHOLE_CHECK_INTERVAL_US)
+        return;
+    ctx->blackhole_check_last_us = now;
+
+    of_flow_stat_t stats[L3_MAX_ROUTES];
+    int count = 0;
+    if (ovs_of_get_all_flow_stats(ctx->bridge, stats,
+                                   L3_MAX_ROUTES, &count) < 0)
+        return;
+
+    for (int i = 0; i < ctx->route_count; i++) {
+        route_entry_t *r = &ctx->routes[i];
+        if (r->state != ROUTE_STATE_ACTIVE) continue;
+        if (r->is_local) {
+            /* Local routes always have traffic from ARP etc — skip */
+            ctx->route_traffic[i].zero_intervals    = 0;
+            ctx->route_traffic[i].blackhole_alerted = 0;
+            ctx->route_traffic[i].isolation_alerted = 0;
+            continue;
+        }
+
+        /* Find matching flow by cookie (= route array index) */
+        uint64_t pkt_count = UINT64_MAX;  /* sentinel: flow not found */
+        for (int j = 0; j < count; j++) {
+            if (stats[j].cookie == (uint64_t)i && stats[j].priority == 100) {
+                pkt_count = stats[j].packet_count;
+                break;
+            }
+        }
+
+        if (pkt_count == UINT64_MAX) {
+            /* Flow not installed — reset counters */
+            ctx->route_traffic[i].zero_intervals = 0;
+            continue;
+        }
+
+        uint64_t last = ctx->route_traffic[i].last_pkt_count;
+
+        if (pkt_count == last) {
+            ctx->route_traffic[i].zero_intervals++;
+
+            /* Blackhole: had traffic before, now stopped */
+            if (ctx->route_traffic[i].zero_intervals >= BLACKHOLE_ZERO_INTERVALS
+                && last > 0
+                && !ctx->route_traffic[i].blackhole_alerted) {
+
+                ctx->route_traffic[i].blackhole_alerted = 1;
+
+                /* Verify ARP reachability for the nexthop */
+                char mac[18] = "";
+                int arp_ok = (l3_arp_resolve(r->nexthop, mac, sizeof(mac)) == 0);
+
+                LOG_W("L3", "[%s] TRAFFIC BLACKHOLE SUSPECTED: route %s "
+                      "had traffic but stopped for %us. "
+                      "Nexthop %s ARP: %s",
+                      ctx->switch_id, r->prefix,
+                      ctx->route_traffic[i].zero_intervals * 10,
+                      r->nexthop, arp_ok ? "OK" : "FAILED");
+
+                if (!arp_ok) {
+                    /* ARP failure confirms nexthop is down */
+                    r->state = ROUTE_STATE_DEGRADED;
+                    LOG_E("L3", "[%s] Blackhole confirmed — nexthop %s unreachable",
+                          ctx->switch_id, r->nexthop);
+                }
+            }
+
+            /* Subnet isolation: NEVER had any traffic */
+            if (ctx->route_traffic[i].zero_intervals >= ISOLATION_ZERO_INTERVALS
+                && last == 0
+                && !ctx->route_traffic[i].isolation_alerted) {
+
+                ctx->route_traffic[i].isolation_alerted = 1;
+
+                char mac[18] = "";
+                int arp_ok = (l3_arp_resolve(r->nexthop, mac, sizeof(mac)) == 0);
+
+                LOG_W("L3", "[%s] SUBNET ISOLATION SUSPECTED: route %s "
+                      "zero traffic for %us since install. "
+                      "Nexthop %s ARP: %s",
+                      ctx->switch_id, r->prefix,
+                      ctx->route_traffic[i].zero_intervals * 10,
+                      r->nexthop, arp_ok ? "reachable" : "FAILED");
+            }
+        } else {
+            /* Traffic is flowing — reset alerts */
+            ctx->route_traffic[i].zero_intervals    = 0;
+            ctx->route_traffic[i].blackhole_alerted = 0;
+            ctx->route_traffic[i].isolation_alerted = 0;
+        }
+
+        ctx->route_traffic[i].last_pkt_count = pkt_count;
+    }
+}
+
+/* ── FSM action handlers ─────────────────────────────────────────────── */
 static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
 {
     l3_agent_ctx_t *ctx = (l3_agent_ctx_t *)agent->userdata;
@@ -1403,13 +1684,9 @@ l3_agent_ctx_t *l3_agent_create(const char *agent_id,
                                   ctx);
             /* Dump initial route table */
             l3_netlink_dump_routes(ctx);
-            // Proactively ARP all transit nexthops so OVS flows get installed
-            // immediately rather than waiting for the first packet.
-            LOG_I("L3", "[%s] Probing ARP for all kernel nexthops...", ctx->switch_id);
-            system("for nh in $(ip route | awk '/via/ {print $3}' | sort -u); do "
-                   "    dev=$(ip route get $nh | awk '/dev/ {for(i=1;i<NF;i++) if($i==\"dev\") print $(i+1)}'); "
-                   "    [ -n \"$dev\" ] && arping -c 2 -I $dev $nh >/dev/null 2>&1 & "
-                   "done");
+            /* Initial ARP dump — will be processed when netlink fd is first readable */
+            LOG_I("L3", "[%s] Netlink ARP dump will trigger on first epoll tick",
+                  ctx->switch_id);
             LOG_I("L3", "[%s] Netlink monitor active fd=%d", switch_id, nl_fd);
         }
         else
@@ -1447,6 +1724,9 @@ void l3_agent_tick(l3_agent_ctx_t *ctx)
     /* Periodic L3 health monitoring (runs from main loop) */
 
     static uint64_t last_health_log_us = 0;
+
+    /* Blackhole and subnet isolation detection every 10s */
+    l3_detect_blackhole_and_isolation(ctx);
 
     uint64_t now = a2a_now_us();
 
