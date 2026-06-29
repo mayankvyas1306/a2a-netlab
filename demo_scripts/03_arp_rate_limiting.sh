@@ -1,15 +1,6 @@
-#!/bin/bash
-
-echo ""
-echo "=== ARP RATE LIMITING ==="
-echo "--- ARP rate-limit flow (permanent, priority=60) ---"
-docker exec sw1 ovs-ofctl -O OpenFlow13 dump-flows br0 \
-  | grep "priority=60"
-
-echo "--- ARP meter (meter:3, 128 kbps cap) ---"
-docker exec sw1 ovs-ofctl -O OpenFlow13 dump-meters br0
-
-echo "--- Sending 1M ARP frames ---"
+echo "--- Sending 1M ARP frames (to trigger DYNAMIC A2A detection, bypassing static meter test separately) ---"
+# Temporarily disable static ARP meter cap to let dynamic agent detection fire
+docker exec sw1 ovs-ofctl -O OpenFlow13 mod-flows br0 "priority=60,arp,actions=output:normal"
 docker exec host1 python3 -c "
 import socket, time
 s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
@@ -32,11 +23,10 @@ s.close()
 " 2>/dev/null
 
 sleep 2
-echo "--- ARP flow packet count after flood ---"
-docker exec sw1 ovs-ofctl -O OpenFlow13 dump-flows br0 \
-  | grep "priority=60"
 
-echo "--- Connectivity maintained after ARP flood ---"
-docker exec host1 ping -c 3 20.0.0.1 -q 2>/dev/null | grep "packet loss"
+echo "--- A2A: dynamic ARP-storm anomaly + policy response ---"
+docker exec sw1 grep -E "ARP STORM|ARP storm" /tmp/agent-sw1.log | tail -5
+docker exec core1 grep "ARP_STORM" /tmp/agent-core1.log | tail -5
 
-echo "=== DONE ==="
+# Restore static meter flow
+docker exec sw1 ovs-ofctl -O OpenFlow13 mod-flows br0 "priority=60,arp,actions=meter:3,output:normal"

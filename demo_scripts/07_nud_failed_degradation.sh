@@ -33,4 +33,9 @@ docker exec core1 tail -20 /tmp/agent-core1.log | grep "ACTIVE"
 echo "--- Connectivity restored ---"
 docker exec host1 ping -c 3 20.0.0.1 -q | grep "packet loss"
 
+echo ""
+echo "--- A2A MESSAGE FLOW: core1 notifies its L2 children of the route-state change ---"
+docker exec sw1 grep "Route update from agent-l3-core1" /tmp/agent-sw1.log | tail -6
+docker exec sw2 grep "Route update from agent-l3-core1" /tmp/agent-sw2.log | tail -6
+
 echo "=== DONE ==="

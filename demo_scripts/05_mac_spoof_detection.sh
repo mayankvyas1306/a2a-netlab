@@ -76,8 +76,9 @@ docker exec host1 ip link set h1s1 address 02:01:01:01:01:01
 docker exec host3 ip link set h3s1 address 02:03:03:03:03:03
 
 docker exec sw1 ovs-ofctl -O OpenFlow13 del-flows br0 "dl_src=aa:bb:cc:dd:ee:ff"
-
 docker exec sw1 ovs-ofctl -O OpenFlow13 del-flows br0 "dl_dst=aa:bb:cc:dd:ee:ff"
+docker exec sw2 ovs-ofctl -O OpenFlow13 del-flows br0 "dl_src=aa:bb:cc:dd:ee:ff"
+docker exec sw2 ovs-ofctl -O OpenFlow13 del-flows br0 "dl_dst=aa:bb:cc:dd:ee:ff"
 
 sleep 2
 
@@ -89,5 +90,15 @@ docker exec sw1 ovs-ofctl -O OpenFlow13 dump-flows br0 | grep "priority=300"
 echo "=== Connectivity restored ==="
 
 docker exec host1 ping -c 3 10.0.0.2 -q 2>/dev/null | grep "packet loss"
+
+echo ""
+echo "--- A2A MESSAGE FLOW (3-hop coordination) ---"
+echo "[1] sw1 detects spoof -> tells L3 core1 AND its L2 peer sw2 in parallel:"
+docker exec sw1 grep -E "MAC SPOOF ATTACK|Notified L2 peer" /tmp/agent-sw1.log | tail -4
+echo "[2] core1 (L3) replies with BLACKHOLE_MAC, addressed back to sw1:"
+docker exec core1 grep "BLACKHOLE_MAC" /tmp/agent-core1.log | tail -2
+echo "[3] sw2 never talked to core1 about this — it blackholed the SAME mac"
+echo "    purely from sw1's direct L2-to-L2 notice:"
+docker exec sw2 grep -E "L2 peer anomaly from agent-l2-sw1|Blackholed MAC" /tmp/agent-sw2.log | tail -4
 
 echo "=== DONE ==="
