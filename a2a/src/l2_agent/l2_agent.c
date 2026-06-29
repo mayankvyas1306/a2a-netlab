@@ -277,6 +277,23 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
             LOG_I("L2", "[%s] Policy received type=%d port=%d rate=%u",
                   ctx->switch_id, pl.policy_type, pl.port, pl.rate_limit);
 
+            /* port=0 means "bridge-wide anomaly" (currently only ARP_STORM
+             * reports this way — see l2_update_traffic_breakdown()). No real
+             * OVS port has port_no==0, so the per-port loop below would
+             * never match and the remediation would be silently dropped.
+             * Handle it directly against the always-installed ARP meter. */
+            if (pl.port == 0 && pl.policy_type == POLICY_RATE_LIMIT)
+            {
+                uint32_t rate_kbps = (pl.rate_limit > 0)
+                    ? (pl.rate_limit * 100 * 8 / 1000) : 128;
+                if (rate_kbps < 32)   rate_kbps = 32;
+                if (rate_kbps > 1500) rate_kbps = 1500;
+                ovs_of_add_meter(ctx->bridge, 3, rate_kbps, 1);
+                LOG_W("L2", "[%s] ARP storm rate limit: meter:3 -> %u kbps",
+                      ctx->switch_id, rate_kbps);
+                break;
+            }
+
             for (int i = 0; i < ctx->port_count; i++)
             {
                 if (ctx->ports[i].port_no != pl.port)
@@ -330,11 +347,14 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
                     snprintf(rl_match, sizeof(rl_match), "in_port=%d", pl.port);
                     ovs_del_flow(ctx->bridge, rl_match);
 
-                    /* Delete isolation drop flow at priority=500 specifically. */
-                    char drop_match[128];
-                    snprintf(drop_match, sizeof(drop_match),
-                             "priority=500,in_port=%d", pl.port);
-                    ovs_del_flow(ctx->bridge, drop_match);
+                    /* Delete isolation drop flow at priority=500 specifically.
+                     * Non-strict OFPFC_DELETE ignores priority entirely, and
+                     * build_flow_mod() never parses "priority=" out of a match
+                     * string — embedding it there was a silent no-op. Use the
+                     * strict-delete path so the priority field is actually sent. */
+                    char drop_match[64];
+                    snprintf(drop_match, sizeof(drop_match), "in_port=%d", pl.port);
+                    ovs_of_del_flow_at_priority(ctx->bridge, drop_match, 500);
 
                     ctx->meter4_installed = 0;
                     LOG_I("L2", "Port %d restored", pl.port);
@@ -464,6 +484,79 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
               ctx->switch_id, msg->src_agent,
               (int)msg->payload_len, msg->payload);
         break;
+
+    case MSG_L2_ANOMALY:
+    {
+        /* Received from a neighboring L2 switch agent */
+        l2_anomaly_payload_t peer_pl = {0};
+        if (a2a_msg_get_l2_anomaly(msg, &peer_pl) != 0)
+            break;
+
+        LOG_I("L2", "[%s] L2 peer anomaly from %s: type=%d port=%d pps=%u",
+              ctx->switch_id, msg->src_agent,
+              peer_pl.anomaly_type, peer_pl.port, peer_pl.pps);
+
+        switch (peer_pl.anomaly_type)
+        {
+        case L2_ANOMALY_MAC_SPOOF:
+        {
+            /* Install blackhole for the same MAC locally */
+            int already = 0;
+            /* Check if we already have a blackhole flow for this MAC */
+            for (int _mi = 0; _mi < ctx->mac_count; _mi++) {
+                if (strncmp(ctx->mac_table[_mi].mac, peer_pl.mac, 17) == 0 &&
+                    ctx->mac_table[_mi].spoof_alerted) {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already && peer_pl.mac[0] != '\0') {
+                ovs_flow_t fl = {0};
+                fl.priority = 300;
+                fl.idle_timeout = 300;
+                snprintf(fl.match, sizeof(fl.match),
+                         "dl_src=%s", peer_pl.mac);
+                snprintf(fl.actions, sizeof(fl.actions), "drop");
+                ovs_add_flow(ctx->bridge, &fl);
+                LOG_W("L2", "[%s] Blackholed MAC %s (learned from L2 peer %s)",
+                      ctx->switch_id, peer_pl.mac, msg->src_agent);
+            }
+            break;
+        }
+
+        case L2_ANOMALY_STORM:
+            /* Log that a neighboring switch is under storm — no local action needed
+             * unless traffic is also elevated on our ports */
+            LOG_I("L2", "[%s] Neighbor %s reports storm on port %d (%u pps) — monitoring",
+                  ctx->switch_id, peer_pl.switch_id, peer_pl.port, peer_pl.pps);
+            break;
+
+        case L2_ANOMALY_STORM_CLEAR:
+            LOG_I("L2", "[%s] Neighbor %s reports storm cleared on port %d",
+                  ctx->switch_id, peer_pl.switch_id, peer_pl.port);
+            break;
+
+        case L2_ANOMALY_LINK_DOWN:
+            LOG_I("L2", "[%s] Neighbor %s reports link down on port %d — "
+                  "no local MAC flush needed (peer uplink failure, not ours)",
+                  ctx->switch_id, peer_pl.switch_id, peer_pl.port);
+            /* Do NOT flush local MACs here. This switch's own port mappings
+             * (e.g., s2c1 → core1) remain valid and form the alternate path
+             * that traffic from the affected switch must now traverse.
+             * Flushing here destroys the alternate path and causes 100% loss
+             * during the failover window while MACs relearn. */
+            break;
+
+        case L2_ANOMALY_LINK_UP:
+            LOG_I("L2", "[%s] Neighbor %s reports link restored on port %d",
+                  ctx->switch_id, peer_pl.switch_id, peer_pl.port);
+            break;
+
+        default:
+            break;
+        }
+        break;
+    }
 
     default:
         LOG_W("L2", "[%s] unhandled msg_type=%d from %s",
@@ -1924,6 +2017,7 @@ static void l2_report_anomaly(l2_agent_ctx_t *ctx,
 
     a2a_msg_set_l2_anomaly(&msg, &pl);
 
+    /* Notify L3 peers */
     for (int i = 0; i < ctx->agent->peer_count; i++)
     {
         agent_peer_t *p = &ctx->agent->peers[i];
@@ -1936,5 +2030,36 @@ static void l2_report_anomaly(l2_agent_ctx_t *ctx,
             ctx->l3_notifies_sent++;
         else
             ctx->agent->send_failures++;
+    }
+
+    /* Notify L2 peers for relevant anomaly types only.
+     * Storm, MAC spoof, link-down, storm-clear, link-up affect
+     * neighboring switches sharing the same subnet paths. */
+    if (anomaly_type == L2_ANOMALY_STORM ||
+        anomaly_type == L2_ANOMALY_STORM_CLEAR ||
+        anomaly_type == L2_ANOMALY_MAC_SPOOF ||
+        anomaly_type == L2_ANOMALY_LINK_DOWN ||
+        anomaly_type == L2_ANOMALY_LINK_UP)
+    {
+        msg.msg_type = MSG_L2_ANOMALY;
+
+        for (int i = 0; i < ctx->agent->peer_count; i++)
+        {
+            agent_peer_t *p = &ctx->agent->peers[i];
+            if (p->type != AGENT_TYPE_L2 || !p->alive)
+                continue;
+
+            strncpy(msg.dst_agent, p->agent_id, A2A_MAX_AGENT_ID - 1);
+
+            if (conn_pool_send(&ctx->agent->pool, p->host, p->port, &msg) == 0)
+            {
+                LOG_I("L2", "[%s] Notified L2 peer %s of anomaly type=%d",
+                      ctx->switch_id, p->agent_id, anomaly_type);
+            }
+            else
+            {
+                ctx->agent->send_failures++;
+            }
+        }
     }
 }

@@ -226,7 +226,6 @@ static void handle_link_change(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx,
         LOG_I("NETLINK", "Link UP: %s", ifname);
     }
 }
-
 /* ── Neighbour (ARP) message parser ─────────────────────────────── */
 
 static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
@@ -273,6 +272,7 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
                 r->last_verified_us = a2a_now_us();
                 LOG_W("NETLINK", "[%s] Route %s DEGRADED (nexthop %s NUD_FAILED)",
                       ctx->switch_id, r->prefix, ip_str);
+                notify_l2_peers_topology(ctx, r, 1);
                 l3_reroute_around(ctx, r->via_switch, -1);
             }
         }
@@ -473,6 +473,7 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
                                   "[%s] Route %s restored DEGRADED→ACTIVE "
                                   "(nexthop %s ARP resolved)",
                                   ctx->switch_id, r->prefix, nh_str);
+                            notify_l2_peers_topology(ctx, r, 0);
                         }
 
                         install_route_flow(ctx,
@@ -704,36 +705,10 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                     strncpy(ex->nexthop, r.nexthop, sizeof(ex->nexthop) - 1);
                     ex->last_verified_us = a2a_now_us();
                     install_route_flow(ctx, ex);
-                    /* Also trigger Netlink ARP dump to ensure nexthop is resolved */
                     l3_netlink_trigger_arp_dump();
                     LOG_I("NETLINK",
                           "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
                           ctx->switch_id, r.prefix, ifname, r.metric);
-                    /* Purge stale failover entries for this prefix with different ifname */
-                    for (int _pi = ctx->route_count - 1; _pi >= 0; _pi--) {
-                        route_entry_t *_pr = &ctx->routes[_pi];
-                        if (_pr == ex) continue;
-                        if (strcmp(_pr->prefix, r.prefix) == 0 &&
-                            strcmp(_pr->egress_ifname, ifname) != 0) {
-                            withdraw_route_flow(ctx, _pr);
-                            LOG_D("NETLINK", "[%s] Purged stale failover route %s via %s",
-                                  ctx->switch_id, r.prefix, _pr->egress_ifname);
-                            if (_pi < ctx->route_count - 1)
-                                memmove(&ctx->routes[_pi], &ctx->routes[_pi + 1],
-                                        (ctx->route_count - _pi - 1) * sizeof(route_entry_t));
-                            ctx->route_count--;
-                            /* ex pointer may have shifted — find it again */
-                            ex = NULL;
-                            for (int _ei = 0; _ei < ctx->route_count; _ei++) {
-                                if (strcmp(ctx->routes[_ei].prefix, r.prefix) == 0 &&
-                                    strcmp(ctx->routes[_ei].egress_ifname, ifname) == 0) {
-                                    ex = &ctx->routes[_ei];
-                                    break;
-                                }
-                            }
-                            if (!ex) break;
-                        }
-                    }
                 }
     
                 /* Track oscillation only for non-local, non-directly-connected routes.
@@ -808,11 +783,8 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                     ctx->conv_log[oldest_slot].valid = 1;
                 }
 
-                /* Withdraw only the exact prefix+ifname entry the kernel deleted.
-                 * l3_withdraw_route() finds only the first prefix match. */
                 {
-                    const char *del_ifname =
-                        r.ifname[0] ? r.ifname : "kernel";
+                    const char *del_ifname = r.ifname[0] ? r.ifname : "kernel";
                     int withdrew = 0;
                     for (int wi = 0; wi < ctx->route_count; wi++) {
                         route_entry_t *wr = &ctx->routes[wi];
@@ -829,8 +801,7 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                         }
                     }
                     if (!withdrew) {
-                        /* Fallback: only call if specific prefix+ifname not found.
-                         * Skip if entry exists but is already WITHDRAWN. */
+                        /* Exact prefix+ifname not found — check if already withdrawn */
                         int already_gone = 0;
                         for (int wi = 0; wi < ctx->route_count; wi++) {
                             route_entry_t *wr = &ctx->routes[wi];
@@ -848,7 +819,6 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                                   ctx->switch_id, r.prefix, del_ifname);
                         }
                     }
-
                 }
                 if (r.metric > 0){
                     l3_track_oscillation(ctx, r.prefix, 0);

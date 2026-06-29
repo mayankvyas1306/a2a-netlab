@@ -326,8 +326,14 @@ static void process_interface_table(cJSON *iface_table, a2a_agent_t *agent)
         iface->link_up = is_up;
         int port_no = iface->ofport > 0 ? iface->ofport : prev_ofport;
 
-        LOG_I("OVSDB", "Interface updated: %s ofport=%d link=%s",
-              iface->name, port_no, iface->link_up ? "up" : "down");
+        int changed = (iface->link_up != was_up) || (iface->ofport != prev_ofport);
+        if (changed || (iface->ofport > 0 && iface->ofport != prev_ofport)) {
+            LOG_I("OVSDB", "Interface updated: %s ofport=%d link=%s",
+                    iface->name, port_no, iface->link_up ? "up" : "down");
+        } else {
+            LOG_D("OVSDB", "Interface polled (no change): %s ofport=%d link=%s",
+                    iface->name, port_no, iface->link_up ? "up" : "down");
+        }
 
         if (was_up && !iface->link_up && agent && agent->card.type == AGENT_TYPE_L2 && agent->userdata) {
             l2_agent_ctx_t *ctx = (l2_agent_ctx_t *)agent->userdata;

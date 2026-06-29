@@ -198,7 +198,7 @@ void withdraw_route_flow(l3_agent_ctx_t *ctx,
 }
 
 /* Notify all known L2 peers of a route/topology change */
-static void notify_l2_peers_topology(l3_agent_ctx_t *ctx,
+void notify_l2_peers_topology(l3_agent_ctx_t *ctx,
                                      const route_entry_t *r,
                                      int is_withdraw)
 {
@@ -234,7 +234,6 @@ static void notify_l2_peers_topology(l3_agent_ctx_t *ctx,
 }
 
 /* ── Route operations ────────────────────────────────────────────────── */
-
 int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
                  const char *nexthop, const char *via_switch, const char *ifname,
                  int metric, int is_local)
@@ -244,7 +243,6 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
         route_entry_t *existing = &ctx->routes[i];
         if (strcmp(existing->prefix, prefix) == 0 &&
             strcmp(existing->egress_ifname, ifname) == 0) {
-            /* Update nexthop/metric and re-activate */
             strncpy(existing->nexthop, nexthop, sizeof(existing->nexthop) - 1);
             strncpy(existing->via_switch, via_switch, A2A_MAX_AGENT_ID - 1);
             existing->metric = metric;
@@ -253,18 +251,13 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
             existing->is_local = is_local;
             install_route_flow(ctx, existing);
             ctx->route_installs++;
-            LOG_I("L3", "[%s] Route reinstated: %s dev %s metric=%d (was WITHDRAWN)",
+            LOG_I("L3", "[%s] Route reinstated: %s dev %s metric=%d",
                   ctx->switch_id, prefix, ifname, metric);
-            /* Only track oscillation for true kernel RTM events, not internal repairs.
-             * The caller sets is_local=1 for kernel-driven reinstalls from RTM_NEWROUTE.
-             * Internal reroutes (storm/link repair) pass is_local=0 but aren't RTM events.
-             * Skip oscillation to prevent false positives from rapid storm handling. */
-            if (existing->state == ROUTE_STATE_WITHDRAWN)
-                l3_track_oscillation(ctx, prefix, 1);
             notify_l2_peers_topology(ctx, existing, 0);
             return 0;
         }
     }
+
     /* Second pass: remove stale entries for same prefix with different ifname.
      * Do this in reverse to allow safe array compaction. */
     for (int i = ctx->route_count - 1; i >= 0; i--) {
@@ -273,7 +266,6 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
             strcmp(ex2->egress_ifname, ifname) != 0) {
             LOG_D("L3", "[%s] Old route %s via %s removed (superseded by %s)",
                   ctx->switch_id, prefix, ex2->egress_ifname, ifname);
-            /* Compact: shift remaining entries left */
             if (i < ctx->route_count - 1) {
                 memmove(&ctx->routes[i], &ctx->routes[i + 1],
                         (ctx->route_count - i - 1) * sizeof(route_entry_t));
@@ -281,8 +273,10 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
             ctx->route_count--;
         }
     }
+
     if (ctx->route_count >= L3_MAX_ROUTES)
         return -1;
+
     route_entry_t *r = &ctx->routes[ctx->route_count++];
     strncpy(r->prefix, prefix, sizeof(r->prefix) - 1);
     strncpy(r->nexthop, nexthop, sizeof(r->nexthop) - 1);
@@ -298,9 +292,7 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
     ctx->route_installs++;
     notify_l2_peers_topology(ctx, r, 0);
 
-    /* Final cleanup: remove all OTHER entries for same prefix regardless of state.
-     * The new entry was appended at index (route_count - 1).
-     * Save its index, do NOT use pointer after memmove. */
+    /* remove all OTHER entries for same prefix regardless of state. */
     int new_idx = ctx->route_count - 1;
     for (int _ci = new_idx - 1; _ci >= 0; _ci--) {
         route_entry_t *_cx = &ctx->routes[_ci];
@@ -310,7 +302,7 @@ int l3_add_route(l3_agent_ctx_t *ctx, const char *prefix,
                         (ctx->route_count - _ci - 1) * sizeof(route_entry_t));
             }
             ctx->route_count--;
-            new_idx--;  /* new entry shifted left */
+            new_idx--;
         }
     }
 
@@ -489,7 +481,7 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
             if (strcmp(r->egress_ifname, "br0") != 0 &&
                 strcmp(r->egress_ifname, ctx->bridge) != 0) continue;
             if (!r->is_local) continue;
-            
+
             char sec_if[IF_NAMESIZE];
             if (l3_find_secondary_iface(ctx, failed_switch, sec_if, sizeof(sec_if)) == 0) {
                 char chk[128];
@@ -504,7 +496,7 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
                           ctx->switch_id, r->prefix, sec_if);
                 }
             }
-            break; 
+            break;
         }
     }
 }
@@ -689,7 +681,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     switch (pl.anomaly_type)
     {
     case L2_ANOMALY_STORM:
-        LOG_I("L3", "Decision: STORM → reroute + rate limit");
+        LOG_I("L3", "Decision: STORM → rate limit");
         l3_reroute_around(ctx, pl.switch_id, pl.port);
         l3_send_policy(ctx, msg->src_agent,
                        POLICY_RATE_LIMIT,
@@ -697,7 +689,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
         break;
 
     case L2_ANOMALY_FLOOD:
-        LOG_I("L3", "Decision: FLOOD → isolate + reroute");
+        LOG_I("L3", "Decision: FLOOD →  rate limit");
         l3_reroute_around(ctx, pl.switch_id, pl.port);
         /*
          * Use RATE_LIMIT instead of ISOLATE_PORT for MAC-flood:
@@ -758,7 +750,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             if (!r->is_local) continue;
             if (strcmp(r->egress_ifname, "br0") != 0 &&
                 strcmp(r->egress_ifname, ctx->bridge) != 0) continue;
-                
+
             char gw_ip[48] = "";
             l3_get_br0_ip(ctx->bridge, gw_ip, sizeof(gw_ip));
             char cmd[256];
@@ -766,7 +758,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
                      "ip route replace %s dev br0 src %s 2>/dev/null",
                      r->prefix, gw_ip);
             system(cmd);
-            
+
             char sec_if[32];
             if (l3_find_secondary_iface(ctx, pl.switch_id, sec_if, sizeof(sec_if)) == 0) {
                 snprintf(cmd, sizeof(cmd),
@@ -776,13 +768,11 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             }
             LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0 (dynamic)",
                   ctx->switch_id, r->prefix);
-                  
-            /* Trigger ARP refresh via Netlink dump — no subprocess */
+
             l3_netlink_trigger_arp_dump_pub();
             break;
         }
 
-        /* Also restore any DEGRADED routes tracked by the route table */
         for (int ri = 0; ri < ctx->route_count; ri++)
         {
             route_entry_t *r = &ctx->routes[ri];
