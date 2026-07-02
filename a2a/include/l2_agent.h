@@ -109,7 +109,8 @@ typedef struct
     uint64_t bcast_pkt_count_prev;
     uint64_t mcast_pkt_count_prev;
     uint64_t arp_pkt_count_prev;
-    uint64_t flow_stat_last_us;
+    uint64_t flow_stat_last_us;          /* timestamp of last SUCCESSFUL read only */
+    uint64_t flow_stat_last_attempt_us;  /* timestamp of last attempt, success or not */
 
     /* ── Meter drop tracking ─────────────────────────────── */
     uint64_t bcast_drop_prev;

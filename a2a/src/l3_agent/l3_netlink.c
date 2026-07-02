@@ -21,6 +21,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/if_ether.h>
 #include <sys/socket.h>
+#include <ifaddrs.h>
 
 #include "l3_agent.h"
 #include "a2a_log.h"
@@ -32,6 +33,13 @@ void l3_track_oscillation(l3_agent_ctx_t *ctx, const char *prefix, int is_instal
 
 static int g_nl_fd = -1;
 static int g_nl_seq = 1;
+
+/* Resolved once from the agent's own bind IP — never hardcoded. Routes
+ * whose egress interface equals this are management-plane routes and
+ * must not be propagated as data-plane routing state to L2 peers. */
+static char g_mgmt_ifname[IF_NAMESIZE] = "";
+static int  g_mgmt_ifname_resolved = 0;
+
 
 /* ── Neighbour table (ARP cache) ─────────────────────────────────── */
 
@@ -45,6 +53,32 @@ typedef struct
 } neigh_entry_t;
 
 static neigh_entry_t g_neigh[NEIGH_TABLE_MAX];
+
+static void resolve_mgmt_ifname(const char *agent_host_ip)
+{
+    if (g_mgmt_ifname_resolved)
+        return;
+    g_mgmt_ifname_resolved = 1;
+
+    struct ifaddrs *ifap, *ifa;
+    if (getifaddrs(&ifap) != 0)
+        return;
+
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        char ipbuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+        if (strcmp(ipbuf, agent_host_ip) == 0) {
+            strncpy(g_mgmt_ifname, ifa->ifa_name, sizeof(g_mgmt_ifname) - 1);
+            LOG_I("NETLINK", "Resolved mgmt interface: %s (ip=%s)",
+                  g_mgmt_ifname, agent_host_ip);
+            break;
+        }
+    }
+    freeifaddrs(ifap);
+}
 
 static void neigh_update(uint32_t ip, const uint8_t *mac)
 {
@@ -219,7 +253,7 @@ static void handle_link_change(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx,
     {
         LOG_W("NETLINK", "Link %s: %s — triggering reroute",
               is_del ? "DEL" : "DOWN", ifname);
-        l3_reroute_around(ctx, ifname, -1);
+         l3_reroute_around(ctx, ifname, -1, 1);
     }
     else
     {
@@ -273,7 +307,7 @@ static void handle_neigh(struct nlmsghdr *nlh, l3_agent_ctx_t *ctx)
                 LOG_W("NETLINK", "[%s] Route %s DEGRADED (nexthop %s NUD_FAILED)",
                       ctx->switch_id, r->prefix, ip_str);
                 notify_l2_peers_topology(ctx, r, 1);
-                l3_reroute_around(ctx, r->via_switch, -1);
+                l3_reroute_specific_route(ctx, r);
             }
         }
         return;  /* do NOT add failed entry to g_neigh[] */
@@ -666,6 +700,13 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
                 const char *ifname =
                     r.ifname[0] ? r.ifname : "kernel";
 
+                resolve_mgmt_ifname(ctx->agent->card.host);
+                if (g_mgmt_ifname[0] && strcmp(ifname, g_mgmt_ifname) == 0) {
+                    LOG_D("NETLINK", "[%s] Skipping mgmt-plane route %s dev %s",
+                          ctx->switch_id, r.prefix, ifname);
+                    break;
+                }
+
                 route_entry_t *ex =
                     find_route_pub(ctx, r.prefix, ifname);
 
@@ -724,6 +765,14 @@ void l3_netlink_process(l3_agent_ctx_t *ctx)
 
                 if (parse_route_msg(nlh, &r) < 0)
                     break;
+
+                const char *ifname = r.ifname[0] ? r.ifname : "kernel";
+                resolve_mgmt_ifname(ctx->agent->card.host);
+                if (g_mgmt_ifname[0] && strcmp(ifname, g_mgmt_ifname) == 0) {
+                    LOG_D("NETLINK", "[%s] Skipping mgmt-plane route %s dev %s",
+                          ctx->switch_id, r.prefix, ifname);
+                    break;
+                }
 
                 LOG_I("NETLINK", "RTM_DELROUTE: %s via %s dev %s",
                       r.prefix, r.nexthop, r.ifname);

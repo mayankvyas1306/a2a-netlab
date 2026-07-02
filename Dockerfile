@@ -5,6 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt update && apt install -y \
     iproute2 \
     iputils-ping \
+    iputils-arping \
     net-tools \
     bridge-utils \
     tcpdump \

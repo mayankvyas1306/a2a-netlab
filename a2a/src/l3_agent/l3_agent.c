@@ -82,6 +82,39 @@ static route_entry_t *find_alternate(l3_agent_ctx_t *ctx,
     return best;
 }
 
+
+/* Reroute a route already known to be affected (e.g. by NUD_FAILED on its
+ * nexthop). Unlike l3_reroute_around(), this does not re-derive "affected"
+ * via switch-id/ifname pattern matching — that matching only makes sense
+ * for L2 link-down / peer-timeout failures. The caller here already knows
+ * the exact route. */
+void l3_reroute_specific_route(l3_agent_ctx_t *ctx, route_entry_t *r)
+{
+    if (!r || r->state == ROUTE_STATE_WITHDRAWN)
+        return;
+
+    route_entry_t *alt = find_alternate(ctx, r->prefix, r->via_switch);
+    if (!alt) {
+        LOG_W("L3", "[%s] No alternate found for %s (nexthop failure) — "
+              "remains DEGRADED, kernel path still active",
+              ctx->switch_id, r->prefix);
+        return;
+    }
+
+    withdraw_route_flow(ctx, r);
+    r->state = ROUTE_STATE_WITHDRAWN;
+    ctx->route_withdrawals++;
+
+    install_route_flow(ctx, alt);
+    ctx->reroutes_performed++;
+
+    LOG_I("L3", "[%s] Reroute complete (nexthop failure): %s via alternate %s",
+          ctx->switch_id, r->prefix, alt->egress_ifname);
+
+    notify_l2_peers_topology(ctx, r, 1);
+    notify_l2_peers_topology(ctx, alt, 0);
+}
+
 /* Install an OVS flow for a route entry.
  * L3 forwarding: dec_ttl + MAC rewrite + port output.
  * Falls back to output:normal when ARP is unresolved. */
@@ -391,7 +424,8 @@ static int l3_get_br0_ip(const char *bridge, char *out, size_t outlen)
 }
 
 void l3_reroute_around(l3_agent_ctx_t *ctx,
-                       const char *failed_switch, int failed_port)
+                       const char *failed_switch, int failed_port,
+                       int is_link_failure)
 {
     LOG_I("L3", "[%s] Rerouting around failed switch=%s port=%d",
           ctx->switch_id, failed_switch, failed_port);
@@ -466,12 +500,17 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
             notify_l2_peers_topology(ctx, r, 1);   // withdraw old
             notify_l2_peers_topology(ctx, alt, 0); // install new
         }
-        else
-        {
-            LOG_W("L3", "[%s] No alternate found for %s — marking degraded",
-                  ctx->switch_id, r->prefix);
+        
+    }
 
-        }
+    /* Kernel route repair + GARP: ONLY for genuine link failures.
+     * Firing this on every STORM/FLOOD anomaly corrupts the kernel
+     * route table and floods spurious GARPs, which then leaves the
+     * system in a bad state by the time a real failure occurs. */
+    if (!is_link_failure) {
+        LOG_D("L3", "[%s] Skipping kernel route repair (traffic anomaly, "
+              "not a link failure)", ctx->switch_id);
+        return;
     }
 
     {
@@ -491,9 +530,37 @@ void l3_reroute_around(l3_agent_ctx_t *ctx,
                     char cmd[256];
                     snprintf(cmd, sizeof(cmd),
                              "ip route replace %s dev %s 2>/dev/null", r->prefix, sec_if);
-                    system(cmd);
-                    LOG_I("L3", "[%s] Kernel route repair: %s via dev %s (dynamic failover)",
-                          ctx->switch_id, r->prefix, sec_if);
+                    int rc = system(cmd);
+                    if (rc != 0) {
+                        LOG_E("L3", "[%s] Kernel route repair FAILED (rc=%d): %s via dev %s",
+                              ctx->switch_id, rc, r->prefix, sec_if);
+                    } else {
+                        LOG_I("L3", "[%s] Kernel route repair: %s via dev %s (dynamic failover)",
+                              ctx->switch_id, r->prefix, sec_if);
+                    }
+
+                    /* Push GARP so hosts update their stale gateway MAC
+                     * immediately instead of waiting on NUD timeout (~30s).
+                     * Without this, first packets after failover are dropped
+                     * until the host's own ARP cache goes stale and re-resolves. */
+                    {
+                        char gw_ip[48] = "";
+                        l3_get_br0_ip(ctx->bridge, gw_ip, sizeof(gw_ip));
+                        if (gw_ip[0]) {
+                            char garp_cmd[256];
+                            snprintf(garp_cmd, sizeof(garp_cmd),
+                                     "arping -U -c 3 -I %s -s %s %s >/dev/null 2>&1 &",
+                                     sec_if, gw_ip, gw_ip);
+                            int rc_garp = system(garp_cmd);
+                            if (rc_garp != 0) {
+                                LOG_E("L3", "[%s] Gratuitous ARP FAILED (rc=%d) for %s via %s",
+                                      ctx->switch_id, rc_garp, gw_ip, sec_if);
+                            } else {
+                                LOG_I("L3", "[%s] Sent gratuitous ARP for %s via %s",
+                                      ctx->switch_id, gw_ip, sec_if);
+                            }
+                        }
+                    }
                 }
             }
             break;
@@ -583,6 +650,7 @@ static void l3_send_policy(l3_agent_ctx_t *ctx,
 static struct
 {
     char src[A2A_MAX_AGENT_ID];
+    int  anomaly_type;
     uint64_t last_action_us;
 } g_anomaly_rate[L2_ANOMALY_SOURCES_MAX];
 
@@ -635,7 +703,6 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     return;
     }
 
-    /* Per-source 2s rate limit for all other anomaly types */
     int slot = -1;
 
     for (int i = 0; i < L2_ANOMALY_SOURCES_MAX; i++)
@@ -647,7 +714,8 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             continue;
         }
 
-        if (strcmp(g_anomaly_rate[i].src, msg->src_agent) == 0)
+        if (strcmp(g_anomaly_rate[i].src, msg->src_agent) == 0 &&
+            g_anomaly_rate[i].anomaly_type == pl.anomaly_type)
         {
             slot = i;
 
@@ -674,7 +742,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     strncpy(g_anomaly_rate[slot].src,
             msg->src_agent,
             A2A_MAX_AGENT_ID - 1);
-
+    g_anomaly_rate[slot].anomaly_type = pl.anomaly_type;
     g_anomaly_rate[slot].last_action_us = now;
 
 
@@ -682,7 +750,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     {
     case L2_ANOMALY_STORM:
         LOG_I("L3", "Decision: STORM → rate limit");
-        l3_reroute_around(ctx, pl.switch_id, pl.port);
+        l3_reroute_around(ctx, pl.switch_id, pl.port, 0);
         l3_send_policy(ctx, msg->src_agent,
                        POLICY_RATE_LIMIT,
                        pl.port, NULL, pl.pps);
@@ -690,7 +758,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
 
     case L2_ANOMALY_FLOOD:
         LOG_I("L3", "Decision: FLOOD →  rate limit");
-        l3_reroute_around(ctx, pl.switch_id, pl.port);
+        l3_reroute_around(ctx, pl.switch_id, pl.port, 0);
         /*
          * Use RATE_LIMIT instead of ISOLATE_PORT for MAC-flood:
          * isolating uplink ports kills routing.
@@ -737,7 +805,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
 
     case L2_ANOMALY_LINK_DOWN:
         LOG_I("L3", "Decision: LINK_DOWN → reroute");
-        l3_reroute_around(ctx, pl.switch_id, pl.port);
+        l3_reroute_around(ctx, pl.switch_id, pl.port, 1); 
         break;
 
     case L2_ANOMALY_LINK_UP:
@@ -757,14 +825,39 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
             snprintf(cmd, sizeof(cmd),
                      "ip route replace %s dev br0 src %s 2>/dev/null",
                      r->prefix, gw_ip);
-            system(cmd);
+            int rc_rep = system(cmd);
+            if (rc_rep != 0) {
+                LOG_E("L3", "[%s] Kernel route restore FAILED (rc=%d): %s via br0",
+                      ctx->switch_id, rc_rep, r->prefix);
+            }
+
+            /* Same staleness problem in reverse: re-announce br0's real MAC
+             * so hosts revert off the failover path quickly. */
+            if (gw_ip[0]) {
+                char garp_cmd[256];
+                snprintf(garp_cmd, sizeof(garp_cmd),
+                         "arping -U -c 3 -I br0 -s %s %s >/dev/null 2>&1 &",
+                         gw_ip, gw_ip);
+                int rc_garp2 = system(garp_cmd);
+                if (rc_garp2 != 0) {
+                    LOG_E("L3", "[%s] Gratuitous ARP (restore) FAILED (rc=%d) for %s via br0",
+                          ctx->switch_id, rc_garp2, gw_ip);
+                } else {
+                    LOG_I("L3", "[%s] Sent gratuitous ARP for %s via br0 (restore)",
+                          ctx->switch_id, gw_ip);
+                }
+            }
 
             char sec_if[32];
             if (l3_find_secondary_iface(ctx, pl.switch_id, sec_if, sizeof(sec_if)) == 0) {
                 snprintf(cmd, sizeof(cmd),
                          "ip route del %s dev %s metric 50 2>/dev/null",
                          r->prefix, sec_if);
-                system(cmd);
+                int rc_del = system(cmd);
+                if (rc_del != 0) {
+                    LOG_E("L3", "[%s] Kernel route del FAILED (rc=%d): %s dev %s",
+                          ctx->switch_id, rc_del, r->prefix, sec_if);
+                }
             }
             LOG_I("L3", "[%s] Kernel route cleanup: restored %s via br0 (dynamic)",
                   ctx->switch_id, r->prefix);
@@ -820,7 +913,7 @@ static void l3_handle_l2_anomaly(l3_agent_ctx_t *ctx,
     case L2_ANOMALY_UNICAST_FLOOD:
         LOG_I("L3", "Decision: UNICAST_FLOOD port %d %u pps → rate limit",
               pl.port, pl.pps);
-        l3_reroute_around(ctx, pl.switch_id, pl.port);
+         l3_reroute_around(ctx, pl.switch_id, pl.port, 0);
         l3_send_policy(ctx, msg->src_agent,
                        POLICY_RATE_LIMIT, pl.port, NULL, pl.pps * 2);
         break;
@@ -1336,7 +1429,7 @@ static void on_peer_timeout(a2a_agent_t *agent, const a2a_event_t *ev)
     }
 
     /* Reroute away from the dead peer's routes */
-    l3_reroute_around(ctx, dead_peer, -1);
+    l3_reroute_around(ctx, dead_peer, -1, 1);
 
     /*
      * Evict only this peer's TCP connection.  A full pool destroy
@@ -1423,7 +1516,7 @@ static void on_heartbeat_tick(a2a_agent_t *agent, const a2a_event_t *ev)
         {
             LOG_W("L3", "[%s] Route stale (via_switch=%s dead): %s",
                   ctx->switch_id, r->via_switch, r->prefix);
-            l3_reroute_around(ctx, r->via_switch, -1);
+            l3_reroute_around(ctx, r->via_switch, -1, 1);
         }
     }
 }
