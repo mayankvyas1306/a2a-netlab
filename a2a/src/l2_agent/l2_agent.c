@@ -537,8 +537,7 @@ static void on_msg_received(a2a_agent_t *agent, const a2a_event_t *ev)
             break;
 
         case L2_ANOMALY_LINK_DOWN:
-            LOG_I("L2", "[%s] Neighbor %s reports link down on port %d — "
-                  "no local MAC flush needed (peer uplink failure, not ours)",
+            LOG_I("L2", "[%s] Neighbor %s reports link down on port %d — ",
                   ctx->switch_id, peer_pl.switch_id, peer_pl.port);
             /* Do NOT flush local MACs here. This switch's own port mappings
              * (e.g., s2c1 → core1) remain valid and form the alternate path
@@ -981,21 +980,35 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
 static void l2_update_traffic_breakdown(l2_agent_ctx_t *ctx)
 {
     uint64_t now = a2a_now_us();
-    if (now - ctx->flow_stat_last_us < L2_FLOW_STAT_INTERVAL_US)
+
+    /* Retry-cadence gate is independent from the "last successful read"
+     * timestamp. If they were the same variable (as before), a failed
+     * read followed later by a success would compute pps against a
+     * falsely-recent elapsed time — producing a huge spurious spike
+     * from stale cumulative counters. This is what caused the frozen
+     * "phantom storm" that never cleared. */
+    if (now - ctx->flow_stat_last_attempt_us < L2_FLOW_STAT_INTERVAL_US)
         return;
+    ctx->flow_stat_last_attempt_us = now;
 
-    double elapsed_s = (double)(now - ctx->flow_stat_last_us) / 1e6;
-    if (elapsed_s <= 0.0) elapsed_s = 0.5;
-
-    /* Get all flow stats from OVS */
     of_flow_stat_t stats[128];
     int count = 0;
     if (ovs_of_get_all_flow_stats(ctx->bridge, stats, 128, &count) < 0 || count == 0) {
-        ctx->flow_stat_last_us = now;
-        return;  /* Don't corrupt prev counters on failed/empty read */
+        LOG_D("L2", "[%s] flow-stat read failed or empty (rc/count=%d) — skipping this cycle",
+              ctx->switch_id, count);
+
+        /* Staleness guard: decay the aggregate flood estimate to zero if
+         * too long since the last successful read, instead of leaving a
+         * frozen value that can never clear because storm_active blocks
+         * the normal reset path. */
+        if (ctx->flow_stat_last_us > 0 &&
+            now - ctx->flow_stat_last_us > (5ULL * 1000000ULL)) {
+            ctx->aggregate_flood_pps = 0;
+            ctx->arp_pps = 0;
+        }
+        return;  /* flow_stat_last_us intentionally NOT touched here */
     }
 
-    /* Extract per-type packet counts by priority */
     uint64_t bcast_pkt = 0, mcast_pkt = 0, arp_pkt = 0;
     for (int i = 0; i < count; i++) {
         if (stats[i].priority == 50)
@@ -1006,7 +1019,19 @@ static void l2_update_traffic_breakdown(l2_agent_ctx_t *ctx)
             arp_pkt   = stats[i].packet_count;
     }
 
-    /* Compute rates */
+    double elapsed_s = (double)(now - ctx->flow_stat_last_us) / 1e6;
+    if (ctx->flow_stat_last_us == 0 || elapsed_s <= 0.0 || elapsed_s > 30.0) {
+        /* First successful read, or an implausibly long gap — establish
+         * a fresh baseline instead of computing a meaningless delta. */
+        ctx->bcast_pkt_count_prev = bcast_pkt;
+        ctx->mcast_pkt_count_prev = mcast_pkt;
+        ctx->arp_pkt_count_prev   = arp_pkt;
+        ctx->flow_stat_last_us    = now;
+        LOG_D("L2", "[%s] flow-stat baseline (re)established (gap=%.1fs)",
+              ctx->switch_id, elapsed_s);
+        return;
+    }
+
     uint64_t bcast_delta = (bcast_pkt >= ctx->bcast_pkt_count_prev)
                            ? bcast_pkt - ctx->bcast_pkt_count_prev : 0;
     uint64_t mcast_delta = (mcast_pkt >= ctx->mcast_pkt_count_prev)
@@ -1020,13 +1045,11 @@ static void l2_update_traffic_breakdown(l2_agent_ctx_t *ctx)
 
     ctx->arp_pps = arp_pps;
 
-    /* Get meter drop stats */
     of_meter_stat_t m1 = {0}, m2 = {0}, m3 = {0};
     ovs_of_get_meter_stats(ctx->bridge, 1, &m1);
     ovs_of_get_meter_stats(ctx->bridge, 2, &m2);
     ovs_of_get_meter_stats(ctx->bridge, 3, &m3);
 
-    /* Update prev counters */
     ctx->bcast_pkt_count_prev = bcast_pkt;
     ctx->mcast_pkt_count_prev = mcast_pkt;
     ctx->arp_pkt_count_prev   = arp_pkt;
@@ -1038,10 +1061,8 @@ static void l2_update_traffic_breakdown(l2_agent_ctx_t *ctx)
     LOG_D("L2", "[%s] Traffic breakdown: bcast=%u pps mcast=%u pps arp=%u pps",
           ctx->switch_id, bcast_pps, mcast_pps, arp_pps);
 
-    /* Store aggregate flood rate — picked up by l2_port_poll() per port */
     ctx->aggregate_flood_pps = (uint32_t)(bcast_pps + mcast_pps);
 
-    /* ARP storm detection */
     if (!ctx->arp_storm_active && arp_pps > ARP_STORM_THRESHOLD_PPS) {
         ctx->arp_storm_active = 1;
         LOG_W("L2", "[%s] ARP STORM DETECTED: %u pps", ctx->switch_id, arp_pps);
@@ -1133,7 +1154,11 @@ void l2_port_poll(l2_agent_ctx_t *ctx)
                                  "ip route replace default via %s 2>/dev/null && "
                                  "ip route replace 10.0.0.0/24 dev %s 2>/dev/null",
                                  gateway, ctx->bridge);
-                        (void)system(cmd);
+                        int rc_restore = system(cmd);
+                        if (rc_restore != 0) {
+                            LOG_E("L2", "[%s] Kernel route restore FAILED (rc=%d) for default via %s",
+                                  ctx->switch_id, rc_restore, gateway);
+                        }
                     }
                     /* Small wait for kernel to process route before notifying L3 */
                     {
@@ -1297,6 +1322,12 @@ void l2_agent_tick(l2_agent_ctx_t *ctx)
     if (now - ctx->table_stat_last_us > 5000000ULL) {
         of_table_stat_t ts = {0};
         if (ovs_of_get_table_stats(ctx->bridge, &ts) == 0) {
+            /* Sanity bound: OVS never legitimately has >100k flows in this lab.
+             * Reject implausible values instead of trusting them blindly. */
+            if (ts.active_count > 100000) {
+                LOG_W("L2", "[%s] Implausible active_count=%u from table stats — discarding",
+                      ctx->switch_id, ts.active_count);
+            } else {
             ctx->of_active_flow_count = ts.active_count;
 
             if (ts.active_count > FDB_OVERFLOW_THRESHOLD
@@ -1310,10 +1341,12 @@ void l2_agent_tick(l2_agent_ctx_t *ctx)
             } else if (ts.active_count < 700) {
                 ctx->fdb_overflow_alerted = 0;
             }
+        }
 
             uint64_t total_lookups = ts.lookup_count;
             uint64_t matched = ts.matched_count;
-            if (total_lookups > 0) {
+            /* Guard against UINT64_MAX underflow */
+            if (total_lookups > 0 && total_lookups >= matched) {
                 uint64_t miss_pct = (total_lookups - matched) * 100 / total_lookups;
                 if (miss_pct > 40)
                     LOG_W("L2", "[%s] High table miss rate: %lu%% "
@@ -1947,11 +1980,15 @@ void l2_handle_link_down(l2_agent_ctx_t *ctx, a2a_event_t *ev)
                 snprintf(cmd, sizeof(cmd),
                          "ip route replace default via %s 2>/dev/null",
                          neighbor);
-                (void)system(cmd);
-
-                LOG_I("L2", "[%s] Alternate path: kernel route → %s, "
-                      "OVS flood via port %d",
-                      ctx->switch_id, neighbor, isw_ofport);
+                int rc_alt = system(cmd);
+                if (rc_alt != 0) {
+                    LOG_E("L2", "[%s] Alternate path route replace FAILED (rc=%d) via %s", 
+                          ctx->switch_id, rc_alt, neighbor);
+                } else {
+                    LOG_I("L2", "[%s] Alternate path: kernel route → %s, "
+                          "OVS flood via port %d",
+                          ctx->switch_id, neighbor, isw_ofport);
+                }
             } else {
                 LOG_W("L2", "[%s] Neighbor IP not in ARP cache — OVS flood via port %d only",
                       ctx->switch_id, isw_ofport);

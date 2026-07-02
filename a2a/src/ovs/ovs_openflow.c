@@ -23,8 +23,9 @@
 #include <sys/stat.h>
 #include <net/ethernet.h>
 #include <endian.h>
-#include "l2_agent.h"
+#include <poll.h>
 
+#include "l2_agent.h"
 #include "ovs_interface.h"
 #include "a2a_log.h"
 #include "a2a_message.h"
@@ -929,6 +930,22 @@ int ovs_of_add_meter(const char *bridge, uint32_t meter_id,
     return 0;
 }
 
+/* ── Blocking-with-timeout receive helper ────────────────────────────
+ * The OpenFlow fd is permanently O_NONBLOCK. SO_RCVTIMEO has NO effect
+ * on a non-blocking socket — recv() returns EAGAIN immediately instead
+ * of waiting. poll() correctly respects non-blocking fds, so use it to
+ * wait for actual readability before calling recv(). */
+static ssize_t of_wait_recv(int fd, void *buf, size_t buflen, int timeout_ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0)
+        return -1;
+    if (!(pfd.revents & POLLIN))
+        return -1;
+    return recv(fd, buf, buflen, 0);
+}
+
 /* ── OpenFlow statistics API ─────────────────────────────────────── */
 
 int ovs_of_get_all_flow_stats(const char *bridge,
@@ -939,24 +956,18 @@ int ovs_of_get_all_flow_stats(const char *bridge,
     of_conn_t *c = of_get_conn(bridge);
     if (!c || c->fd < 0) return -1;
 
-    /* Build OFPMP_FLOW request — 56 bytes */
     uint8_t req[56] = {0};
     req[0] = OFP13_VERSION;
-    req[1] = 18;  /* OFPT_MULTIPART_REQUEST */
+    req[1] = 18;
     uint16_t rlen = htons(56);
     memcpy(req + 2, &rlen, 2);
     uint32_t xid = htonl(g_xid++);
     memcpy(req + 4, &xid, 4);
-    /* OFPMP_FLOW = 1 */
     uint16_t mp_type = htons(1);
     memcpy(req + 8, &mp_type, 2);
-    /* body: table_id=OFPTT_ALL at offset 16 */
     req[16] = 0xFF;
-    /* out_port=OFPP_ANY */
     memset(req + 20, 0xFF, 4);
-    /* out_group=OFPG_ANY */
     memset(req + 24, 0xFF, 4);
-    /* match: OXM empty at offset 48 */
     uint16_t mt = htons(1);
     memcpy(req + 48, &mt, 2);
     uint16_t ml = htons(4);
@@ -967,32 +978,31 @@ int ovs_of_get_all_flow_stats(const char *bridge,
         return -1;
     }
 
-    /* Temporarily set 300ms recv timeout */
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     uint8_t reply[16384];
     int total = 0;
+    int budget_ms = 300;
 
     for (;;) {
-        ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+        if (budget_ms <= 0) break;
+
+        uint64_t t0 = a2a_now_us();
+        ssize_t n = of_wait_recv(c->fd, reply, sizeof(reply), budget_ms);
+        budget_ms -= (int)((a2a_now_us() - t0) / 1000);
         if (n <= 0) break;
 
         ofp_header_t *hdr = (ofp_header_t *)reply;
-        /* Skip ECHO_REQUEST (type=2) and PACKET_IN (type=10): service them inline */
-        if (hdr->type == 2) {  /* OFPT_ECHO_REQUEST */
+        if (hdr->type == 2) {
             ofp_header_t echo_reply = *hdr;
-            echo_reply.type = 3;  /* OFPT_ECHO_REPLY */
+            echo_reply.type = 3;
             send(c->fd, &echo_reply, sizeof(echo_reply), MSG_NOSIGNAL);
-            continue;  /* keep waiting for stats reply */
+            continue;
         }
-        if (hdr->type != 19) continue;  /* skip non-multipart, keep waiting */
+        if (hdr->type != 19) continue;
 
         uint16_t reply_mp_type;
         memcpy(&reply_mp_type, reply + 8, 2);
-        if (ntohs(reply_mp_type) != 1) continue;  /* not OFPMP_FLOW, skip */
+        if (ntohs(reply_mp_type) != 1) continue;
 
-        /* Parse flow entries starting at offset 16 */
         int off = 16;
         while (off + 56 <= (int)n && total < max) {
             uint16_t entry_len;
@@ -1002,24 +1012,14 @@ int ovs_of_get_all_flow_stats(const char *bridge,
                 break;
 
             of_flow_stat_t *s = &out[total];
-
-            /* duration_sec at +4 */
             uint32_t dur; memcpy(&dur, reply + off + 4, 4);
             s->duration_sec = ntohl(dur);
-
-            /* cookie at +8 */
             uint64_t ck; memcpy(&ck, reply + off + 8, 8);
             s->cookie = be64toh(ck);
-
-            /* priority at +12 */
             uint16_t pri; memcpy(&pri, reply + off + 12, 2);
             s->priority = ntohs(pri);
-
-            /* packet_count at +32 */
             uint64_t pc; memcpy(&pc, reply + off + 32, 8);
             s->packet_count = be64toh(pc);
-
-            /* byte_count at +40 */
             uint64_t bc; memcpy(&bc, reply + off + 40, 8);
             s->byte_count = be64toh(bc);
 
@@ -1027,18 +1027,13 @@ int ovs_of_get_all_flow_stats(const char *bridge,
             off += entry_len;
         }
 
-        /* Check OFPMP more-replies flag (bit 0 at offset 10) */
         uint16_t flags; memcpy(&flags, reply + 10, 2);
         if (!(ntohs(flags) & 0x0001)) break;
     }
 
-    /* Restore non-blocking */
-    tv.tv_sec = 0; tv.tv_usec = 0;
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     *count_out = total;
     LOG_D("OF", "[%s] flow stats: %d entries", bridge, total);
-    return 0;
+    return (total > 0) ? 0 : -1;
 }
 
 int ovs_of_get_meter_stats(const char *bridge,
@@ -1051,7 +1046,6 @@ int ovs_of_get_meter_stats(const char *bridge,
     of_conn_t *c = of_get_conn(bridge);
     if (!c || c->fd < 0) return -1;
 
-    /* OFPMP_METER = 9, request is 24 bytes */
     uint8_t req[24] = {0};
     req[0] = OFP13_VERSION;
     req[1] = 18;
@@ -1066,39 +1060,43 @@ int ovs_of_get_meter_stats(const char *bridge,
 
     if (send(c->fd, req, 24, MSG_NOSIGNAL) < 0) return -1;
 
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint8_t reply[512];
+    int budget_ms = 300;
 
-    uint8_t reply[512] = {0};
-    ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+    for (;;) {
+        if (budget_ms <= 0) return -1;
+        uint64_t t0 = a2a_now_us();
+        ssize_t n = of_wait_recv(c->fd, reply, sizeof(reply), budget_ms);
+        budget_ms -= (int)((a2a_now_us() - t0) / 1000);
+        if (n < 8) return -1;
 
-    tv.tv_usec = 0;
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ofp_header_t *hdr = (ofp_header_t *)reply;
 
-    if (n < 56) return -1;
+        if (hdr->type == 2) { /* ECHO_REQUEST — service it, keep waiting */
+            ofp_header_t echo_reply = *hdr;
+            echo_reply.type = 3;
+            send(c->fd, &echo_reply, sizeof(echo_reply), MSG_NOSIGNAL);
+            continue;
+        }
+        if (hdr->type != 19) continue;      /* not a multipart reply — skip */
 
-    /* ofp_meter_stats layout after 16-byte multipart reply header:
-     * [0] meter_id(4) [4] len(2) [6] pad(6)
-     * [12] flow_count(4) [16] packet_in_count(8) [24] byte_in_count(8)
-     * [32] duration_sec(4) [36] duration_nsec(4)
-     * [40] band_stats[0]: packet_band_count(8) [48] byte_band_count(8) */
-    int base = 16;
-    if (n < base + 56) return -1;
+        uint16_t reply_mp_type;
+        memcpy(&reply_mp_type, reply + 8, 2);
+        if (ntohs(reply_mp_type) != 9) continue;  /* not OFPMP_METER — skip */
 
-    uint64_t pic; memcpy(&pic, reply + base + 16, 8);
-    out->packet_in_count = be64toh(pic);
+        if (n < 16 + 56) return -1;
 
-    uint64_t bic; memcpy(&bic, reply + base + 24, 8);
-    out->byte_in_count = be64toh(bic);
-
-    if (n >= base + 56) {
+        int base = 16;
+        uint64_t pic; memcpy(&pic, reply + base + 16, 8);
+        out->packet_in_count = be64toh(pic);
+        uint64_t bic; memcpy(&bic, reply + base + 24, 8);
+        out->byte_in_count = be64toh(bic);
         uint64_t pbc; memcpy(&pbc, reply + base + 40, 8);
         out->packet_band_count = be64toh(pbc);
-
         uint64_t bbc; memcpy(&bbc, reply + base + 48, 8);
         out->byte_band_count = be64toh(bbc);
+        return 0;
     }
-    return 0;
 }
 
 int ovs_of_get_table_stats(const char *bridge,
@@ -1109,7 +1107,6 @@ int ovs_of_get_table_stats(const char *bridge,
     of_conn_t *c = of_get_conn(bridge);
     if (!c || c->fd < 0) return -1;
 
-    /* OFPMP_TABLE = 3, request is 16 bytes (header only) */
     uint8_t req[16] = {0};
     req[0] = OFP13_VERSION;
     req[1] = 18;
@@ -1122,31 +1119,41 @@ int ovs_of_get_table_stats(const char *bridge,
 
     if (send(c->fd, req, 16, MSG_NOSIGNAL) < 0) return -1;
 
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint8_t reply[512];
+    int budget_ms = 300;
 
-    uint8_t reply[512] = {0};
-    ssize_t n = recv(c->fd, reply, sizeof(reply), 0);
+    for (;;) {
+        if (budget_ms <= 0) return -1;
+        uint64_t t0 = a2a_now_us();
+        ssize_t n = of_wait_recv(c->fd, reply, sizeof(reply), budget_ms);
+        budget_ms -= (int)((a2a_now_us() - t0) / 1000);
+        if (n < 8) return -1;
 
-    tv.tv_usec = 0;
-    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ofp_header_t *hdr = (ofp_header_t *)reply;
 
-    /* ofp_table_stats after 16-byte header:
-     * [0] table_id(1) [1] pad(3)
-     * [4] active_count(4) [8] lookup_count(8) [16] matched_count(8) */
-    if (n < 16 + 24) return -1;
+        if (hdr->type == 2) {
+            ofp_header_t echo_reply = *hdr;
+            echo_reply.type = 3;
+            send(c->fd, &echo_reply, sizeof(echo_reply), MSG_NOSIGNAL);
+            continue;
+        }
+        if (hdr->type != 19) continue;
 
-    int base = 16;
-    uint32_t ac; memcpy(&ac, reply + base + 4, 4);
-    out->active_count = ntohl(ac);
+        uint16_t reply_mp_type;
+        memcpy(&reply_mp_type, reply + 8, 2);
+        if (ntohs(reply_mp_type) != 3) continue;  /* not OFPMP_TABLE — skip */
 
-    uint64_t lc; memcpy(&lc, reply + base + 8, 8);
-    out->lookup_count = be64toh(lc);
+        if (n < 16 + 24) return -1;
 
-    uint64_t mc; memcpy(&mc, reply + base + 16, 8);
-    out->matched_count = be64toh(mc);
-
-    return 0;
+        int base = 16;
+        uint32_t ac; memcpy(&ac, reply + base + 4, 4);
+        out->active_count = ntohl(ac);
+        uint64_t lc; memcpy(&lc, reply + base + 8, 8);
+        out->lookup_count = be64toh(lc);
+        uint64_t mc; memcpy(&mc, reply + base + 16, 8);
+        out->matched_count = be64toh(mc);
+        return 0;
+    }
 }
 
 /* ── Public flow management API ──────────────────────────────────── */

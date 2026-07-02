@@ -7,7 +7,6 @@
 #include "a2a_event.h"
 #include "a2a_connpool.h"
 
-typedef struct udp_discovery udp_discovery_t;
 
 typedef enum {
     AGENT_TYPE_L2 = 1,
@@ -64,7 +63,6 @@ struct a2a_agent {
     agent_peer_t  peers[A2A_MAX_PEERS];
     int           peer_count;
 
-    udp_discovery_t *discovery;
 
     agent_dispatch_entry_t dispatch[A2A_DISPATCH_MAX];
     int            dispatch_count;

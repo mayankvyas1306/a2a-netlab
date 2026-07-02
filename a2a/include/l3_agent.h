@@ -100,7 +100,8 @@ int l3_add_route(l3_agent_ctx_t *ctx,
 int  l3_withdraw_route(l3_agent_ctx_t *ctx, const char *prefix,
                        const char *reason);
 void l3_reroute_around(l3_agent_ctx_t *ctx, const char *failed_switch,
-                       int failed_port);
+                       int failed_port, int is_link_failure);
+void l3_reroute_specific_route(l3_agent_ctx_t *ctx, route_entry_t *r);
 void l3_sync_routes_to_peer(l3_agent_ctx_t *ctx, const char *peer_id,
                              const char *peer_host, int peer_port);
 void l3_print_routes (l3_agent_ctx_t *ctx);
