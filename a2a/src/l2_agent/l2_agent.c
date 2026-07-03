@@ -910,15 +910,14 @@ void l2_detect_storm(l2_agent_ctx_t *ctx, int port_idx, uint64_t pps)
                               (pps >= thresh_active * 3) ||
                               (ctx->aggregate_flood_pps >= thresh_active && pps >= thresh_active);
         if (bcast_confirmed) {
-            if (!ps->storm_active) {
+            int is_new_storm = !ps->storm_active;
+            if (is_new_storm) {
                 ps->storm_detected_us = now;
+                ctx->storms_detected++;
+                LOG_W("L2", "STORM DETECTED port=%d pps=%lu", ps->port_no, pps);
             }
             ps->storm_active = 1;
             ps->current_pps = (uint32_t)pps;
-            ctx->storms_detected++;
-            /* (Rest of block continues as normal below this) */
-
-            LOG_W("L2", "STORM DETECTED port=%d pps=%lu", ps->port_no, pps);
 
             if (now - ps->last_event_sent_us > 1000000)
             {
